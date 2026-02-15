@@ -136,3 +136,33 @@ class PolymarketEvent(Base):
     is_active = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class MarketProjection3D(Base):
+    """Cached 3D projection coordinates for semantic discovery rendering."""
+
+    __tablename__ = "market_projection_3d"
+
+    market_id = Column(String, primary_key=True)
+    x = Column(Float, nullable=False)
+    y = Column(Float, nullable=False)
+    z = Column(Float, nullable=False)
+    projection_version = Column(String, nullable=False, index=True)
+    embedding_version = Column(String, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_projection_xyz", "x", "y", "z"),
+        Index("idx_projection_version_market", "projection_version", "market_id"),
+    )
+
+
+class DiscoveryTilesCache(Base):
+    """Optional cache table for viewport/tile graph payloads."""
+
+    __tablename__ = "discovery_tiles_cache"
+
+    tile_key = Column(String, primary_key=True)
+    projection_version = Column(String, nullable=False, index=True)
+    payload_json = Column(JSONB, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

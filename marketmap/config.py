@@ -42,6 +42,19 @@ class Settings(BaseSettings):
     hedge_min_points: int = 6
     hedge_min_confidence: float = 0.35
 
+    # 3D projection (UMAP)
+    projection_umap_n_neighbors: int = 25
+    projection_umap_min_dist: float = 0.12
+    projection_umap_metric: str = "cosine"
+    projection_umap_random_state: int = 42
+    projection_batch_limit: int = 50000
+
+    # Progressive loading defaults
+    discovery_viewport_default_max_nodes: int = 2500
+    discovery_viewport_default_max_edges_per_node: int = 15
+    discovery_viewport_default_pad: float = 0.15
+    discovery_viewport_cache_ttl_seconds: int = 60
+
     # Worker cadences (seconds)
     market_ingestion_interval_seconds: int = 300  # 5 min
     price_snapshot_interval_seconds: int = 300  # 5 min

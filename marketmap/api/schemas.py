@@ -22,6 +22,10 @@ class MarketNode(BaseModel):
     category: str | None = None
     close_time: datetime | None = None
     event_id: str | None = None
+    x: float | None = None
+    y: float | None = None
+    z: float | None = None
+    projection_version: str | None = None
 
 
 class GraphLink(BaseModel):
@@ -66,6 +70,10 @@ class MarketDetail(BaseModel):
     probability: float | None = None
     event_id: str | None = None
     is_active: bool = True
+    x: float | None = None
+    y: float | None = None
+    z: float | None = None
+    projection_version: str | None = None
 
 
 class PricePoint(BaseModel):

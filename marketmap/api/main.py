@@ -1,12 +1,13 @@
 """FastAPI application for MarketMap API."""
 
+import hashlib
 import json
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from redis import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +20,7 @@ from marketmap.api.schemas import (
     MarketPriceHistory,
     PricePoint,
 )
+from marketmap.config import settings
 from marketmap.models.database import get_async_session
 
 logger = logging.getLogger(__name__)
@@ -40,12 +42,22 @@ app.add_middleware(
 
 # --- Helpers ---
 
-# Standard columns selected for market node/detail construction.
-# Order: id, title, link, outcome_prices, volume, liquidity, category, close_time, event_id, description, is_active
+# Order:
+# id, title, link, outcome_prices, volume, liquidity, category, close_time,
+# event_id, description, is_active, x, y, z, projection_version
 MARKET_COLS = (
     "m.id, m.title, m.link, m.outcome_prices, m.volume, m.liquidity, "
-    "m.category, m.close_time, m.event_id, m.description, m.is_active"
+    "m.category, m.close_time, m.event_id, m.description, m.is_active, "
+    "p.x, p.y, p.z, p.projection_version"
 )
+MARKET_JOIN = "LEFT JOIN market_projection_3d p ON p.market_id = m.id"
+
+
+def _get_redis_client() -> Redis | None:
+    try:
+        return Redis.from_url(settings.redis_url, decode_responses=True)
+    except Exception:
+        return None
 
 
 def _parse_prob(outcome_prices_str: str | None) -> float | None:
@@ -59,7 +71,6 @@ def _parse_prob(outcome_prices_str: str | None) -> float | None:
 
 
 def _row_to_node(row) -> MarketNode:  # type: ignore[no-untyped-def]
-    """Convert a DB row (MARKET_COLS order) to MarketNode."""
     return MarketNode(
         id=row[0],
         label=row[1] or "",
@@ -71,11 +82,14 @@ def _row_to_node(row) -> MarketNode:  # type: ignore[no-untyped-def]
         category=row[6],
         close_time=row[7],
         event_id=row[8],
+        x=row[11],
+        y=row[12],
+        z=row[13],
+        projection_version=row[14],
     )
 
 
 def _row_to_detail(row) -> MarketDetail:  # type: ignore[no-untyped-def]
-    """Convert a DB row (MARKET_COLS order) to MarketDetail."""
     return MarketDetail(
         id=row[0],
         title=row[1] or "",
@@ -88,11 +102,14 @@ def _row_to_detail(row) -> MarketDetail:  # type: ignore[no-untyped-def]
         probability=_parse_prob(row[3]),
         event_id=row[8],
         is_active=row[10] == 1.0 if row[10] is not None else True,
+        x=row[11],
+        y=row[12],
+        z=row[13],
+        projection_version=row[14],
     )
 
 
 def _edge_row_to_link(row) -> GraphLink:  # type: ignore[no-untyped-def]
-    """Convert a market_edges row to GraphLink."""
     return GraphLink(
         source=row[0],
         target=row[1],
@@ -109,12 +126,170 @@ def _edge_row_to_link(row) -> GraphLink:  # type: ignore[no-untyped-def]
     )
 
 
+async def _latest_projection_version(session: AsyncSession) -> str | None:
+    result = await session.execute(
+        text(
+            """
+            SELECT projection_version
+            FROM market_projection_3d
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        )
+    )
+    return result.scalar()
+
+
+def _lod_limits(lod: str, max_nodes: int, max_edges_per_node: int) -> tuple[str, int, int]:
+    normalized = lod.lower()
+    if normalized == "auto":
+        normalized = "mid"
+    if normalized == "far":
+        return normalized, min(max_nodes, 1200), min(max_edges_per_node, 5)
+    if normalized == "mid":
+        return normalized, min(max_nodes, 2500), min(max_edges_per_node, 10)
+    return "near", max_nodes, max_edges_per_node
+
+
+def _cache_key_for_viewport(
+    projection_version: str,
+    min_x: float,
+    max_x: float,
+    min_y: float,
+    max_y: float,
+    min_z: float,
+    max_z: float,
+    lod: str,
+    include_edges: bool,
+    max_nodes: int,
+    max_edges_per_node: int,
+    min_similarity: float,
+) -> str:
+    payload = {
+        "projection_version": projection_version,
+        "min_x": round(min_x, 4),
+        "max_x": round(max_x, 4),
+        "min_y": round(min_y, 4),
+        "max_y": round(max_y, 4),
+        "min_z": round(min_z, 4),
+        "max_z": round(max_z, 4),
+        "lod": lod,
+        "include_edges": include_edges,
+        "max_nodes": max_nodes,
+        "max_edges_per_node": max_edges_per_node,
+        "min_similarity": min_similarity,
+    }
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return f"discovery_viewport:{digest}"
+
+
+async def _build_discovery_viewport(
+    session: AsyncSession,
+    projection_version: str,
+    min_x: float,
+    max_x: float,
+    min_y: float,
+    max_y: float,
+    min_z: float,
+    max_z: float,
+    include_edges: bool,
+    max_nodes: int,
+    max_edges_per_node: int,
+    min_similarity: float,
+    lod: str,
+) -> dict[str, Any]:
+    node_result = await session.execute(
+        text(
+            f"""
+            SELECT {MARKET_COLS}
+            FROM markets m
+            JOIN market_projection_3d p ON p.market_id = m.id
+            WHERE m.is_active = 1.0
+              AND p.projection_version = :projection_version
+              AND p.x BETWEEN :min_x AND :max_x
+              AND p.y BETWEEN :min_y AND :max_y
+              AND p.z BETWEEN :min_z AND :max_z
+            ORDER BY m.volume DESC NULLS LAST
+            LIMIT :max_nodes
+            """
+        ),
+        {
+            "projection_version": projection_version,
+            "min_x": min_x,
+            "max_x": max_x,
+            "min_y": min_y,
+            "max_y": max_y,
+            "min_z": min_z,
+            "max_z": max_z,
+            "max_nodes": max_nodes,
+        },
+    )
+
+    nodes = [_row_to_node(row) for row in node_result.fetchall()]
+    node_ids = [n.id for n in nodes]
+
+    links: list[GraphLink] = []
+    if include_edges and node_ids:
+        edge_result = await session.execute(
+            text(
+                """
+                WITH ranked_edges AS (
+                    SELECT source_id, target_id, confidence_score, edge_type,
+                           semantic_score, stat_score, logical_score, propagation_score,
+                           entity_overlap_score, template_penalty, explanation,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY source_id
+                               ORDER BY confidence_score DESC
+                           ) AS rn
+                    FROM market_edges
+                    WHERE edge_type = 'discovery'
+                      AND confidence_score >= :min_similarity
+                      AND source_id = ANY(:node_ids)
+                      AND target_id = ANY(:node_ids)
+                )
+                SELECT source_id, target_id, confidence_score, edge_type,
+                       semantic_score, stat_score, logical_score, propagation_score,
+                       entity_overlap_score, template_penalty, explanation
+                FROM ranked_edges
+                WHERE rn <= :max_edges_per_node
+                ORDER BY confidence_score DESC
+                LIMIT :edge_cap
+                """
+            ),
+            {
+                "node_ids": node_ids,
+                "min_similarity": min_similarity,
+                "max_edges_per_node": max_edges_per_node,
+                "edge_cap": max_nodes * max_edges_per_node,
+            },
+        )
+        links = [_edge_row_to_link(row) for row in edge_result.fetchall()]
+
+    return {
+        "nodes": [n.model_dump() for n in nodes],
+        "links": [l.model_dump() for l in links],
+        "meta": {
+            "projection_version": projection_version,
+            "lod": lod,
+            "bounds": {
+                "min_x": min_x,
+                "max_x": max_x,
+                "min_y": min_y,
+                "max_y": max_y,
+                "min_z": min_z,
+                "max_z": max_z,
+            },
+            "node_count": len(nodes),
+            "edge_count": len(links),
+        },
+    }
+
+
 # --- Health ---
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check(session: AsyncSession = Depends(get_async_session)) -> HealthResponse:
-    """Health check with basic stats."""
     try:
         result = await session.execute(text("SELECT COUNT(*) FROM markets WHERE is_active = 1.0"))
         markets_count = result.scalar()
@@ -141,7 +316,6 @@ async def get_discovery_graph(
     limit: int = Query(200, ge=1, le=1000, description="Max nodes to return"),
     session: AsyncSession = Depends(get_async_session),
 ) -> GraphResponse:
-    """Serve the semantic discovery map (GitHub-style exploration)."""
     params: dict[str, Any] = {"limit": limit}
     where_clauses = ["m.is_active = 1.0"]
 
@@ -152,21 +326,21 @@ async def get_discovery_graph(
     where_sql = " AND ".join(where_clauses)
 
     result = await session.execute(
-        text(f"SELECT {MARKET_COLS} FROM markets m WHERE {where_sql} "
-             "ORDER BY m.volume DESC NULLS LAST LIMIT :limit"),
+        text(
+            f"SELECT {MARKET_COLS} FROM markets m {MARKET_JOIN} WHERE {where_sql} "
+            "ORDER BY m.volume DESC NULLS LAST LIMIT :limit"
+        ),
         params,
     )
 
-    nodes: list[MarketNode] = []
-    node_ids: set[str] = set()
-    for row in result.fetchall():
-        nodes.append(_row_to_node(row))
-        node_ids.add(row[0])
+    nodes = [_row_to_node(row) for row in result.fetchall()]
+    node_ids = [n.id for n in nodes]
 
     links: list[GraphLink] = []
     if node_ids:
         edge_result = await session.execute(
-            text("""
+            text(
+                """
                 SELECT source_id, target_id, confidence_score, edge_type,
                        semantic_score, stat_score, logical_score, propagation_score,
                        entity_overlap_score, template_penalty, explanation
@@ -177,20 +351,161 @@ async def get_discovery_graph(
                   AND target_id = ANY(:node_ids)
                 ORDER BY confidence_score DESC
                 LIMIT 1000
-            """),
-            {"min_conf": min_conf, "node_ids": list(node_ids)},
+                """
+            ),
+            {"min_conf": min_conf, "node_ids": node_ids},
         )
-        for erow in edge_result.fetchall():
-            links.append(_edge_row_to_link(erow))
+        links = [_edge_row_to_link(erow) for erow in edge_result.fetchall()]
+
+    projection_version = next((n.projection_version for n in nodes if n.projection_version), None)
 
     return GraphResponse(
-        nodes=nodes, links=links,
-        meta={"topic": topic, "min_conf": min_conf,
-              "node_count": len(nodes), "edge_count": len(links)},
+        nodes=nodes,
+        links=links,
+        meta={
+            "topic": topic,
+            "min_conf": min_conf,
+            "node_count": len(nodes),
+            "edge_count": len(links),
+            "projection_version": projection_version,
+        },
     )
 
 
-# --- Hedge Graph (Related Markets) ---
+@app.get("/graph/discovery/viewport", response_model=GraphResponse)
+async def get_discovery_viewport(
+    min_x: float = Query(...),
+    max_x: float = Query(...),
+    min_y: float = Query(...),
+    max_y: float = Query(...),
+    min_z: float | None = Query(None),
+    max_z: float | None = Query(None),
+    projection_version: str | None = Query(None),
+    pad: float = Query(settings.discovery_viewport_default_pad, ge=0.0, le=1.0),
+    max_nodes: int = Query(settings.discovery_viewport_default_max_nodes, ge=50, le=5000),
+    max_edges_per_node: int = Query(settings.discovery_viewport_default_max_edges_per_node, ge=1, le=30),
+    min_similarity: float = Query(0.55, ge=0.0, le=1.0),
+    lod: str = Query("auto"),
+    include_edges: bool = Query(True),
+    session: AsyncSession = Depends(get_async_session),
+) -> GraphResponse:
+    if min_x > max_x or min_y > max_y:
+        raise HTTPException(status_code=400, detail="Invalid bounds")
+
+    pversion = projection_version or await _latest_projection_version(session)
+    if not pversion:
+        return GraphResponse(nodes=[], links=[], meta={"error": "No projection available"})
+
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    span_z = (max_z - min_z) if (min_z is not None and max_z is not None) else max(span_x, span_y)
+
+    min_x_pad = min_x - (span_x * pad)
+    max_x_pad = max_x + (span_x * pad)
+    min_y_pad = min_y - (span_y * pad)
+    max_y_pad = max_y + (span_y * pad)
+
+    z_min = min_z if min_z is not None else -1e9
+    z_max = max_z if max_z is not None else 1e9
+    min_z_pad = z_min - (span_z * pad)
+    max_z_pad = z_max + (span_z * pad)
+
+    lod_resolved, max_nodes_resolved, max_edges_resolved = _lod_limits(lod, max_nodes, max_edges_per_node)
+
+    redis_client = _get_redis_client()
+    cache_key = _cache_key_for_viewport(
+        projection_version=pversion,
+        min_x=min_x_pad,
+        max_x=max_x_pad,
+        min_y=min_y_pad,
+        max_y=max_y_pad,
+        min_z=min_z_pad,
+        max_z=max_z_pad,
+        lod=lod_resolved,
+        include_edges=include_edges,
+        max_nodes=max_nodes_resolved,
+        max_edges_per_node=max_edges_resolved,
+        min_similarity=min_similarity,
+    )
+
+    if redis_client is not None:
+        try:
+            cached = redis_client.get(cache_key)
+            if cached:
+                payload = json.loads(cached)
+                return GraphResponse(**payload)
+        except Exception:
+            logger.warning("Redis cache read failed", exc_info=True)
+
+    payload = await _build_discovery_viewport(
+        session=session,
+        projection_version=pversion,
+        min_x=min_x_pad,
+        max_x=max_x_pad,
+        min_y=min_y_pad,
+        max_y=max_y_pad,
+        min_z=min_z_pad,
+        max_z=max_z_pad,
+        include_edges=include_edges,
+        max_nodes=max_nodes_resolved,
+        max_edges_per_node=max_edges_resolved,
+        min_similarity=min_similarity,
+        lod=lod_resolved,
+    )
+
+    if redis_client is not None:
+        try:
+            redis_client.setex(
+                cache_key,
+                settings.discovery_viewport_cache_ttl_seconds,
+                json.dumps(payload),
+            )
+        except Exception:
+            logger.warning("Redis cache write failed", exc_info=True)
+
+    return GraphResponse(**payload)
+
+
+@app.get("/graph/discovery/tile", response_model=GraphResponse)
+async def get_discovery_tile(
+    tile_x: int,
+    tile_y: int,
+    tile_z: int,
+    tile_size: float = Query(0.5, gt=0.0),
+    projection_version: str | None = Query(None),
+    lod: str = Query("auto"),
+    include_edges: bool = Query(True),
+    min_similarity: float = Query(0.55, ge=0.0, le=1.0),
+    max_nodes: int = Query(settings.discovery_viewport_default_max_nodes, ge=50, le=5000),
+    max_edges_per_node: int = Query(settings.discovery_viewport_default_max_edges_per_node, ge=1, le=30),
+    session: AsyncSession = Depends(get_async_session),
+) -> GraphResponse:
+    min_x = tile_x * tile_size
+    max_x = min_x + tile_size
+    min_y = tile_y * tile_size
+    max_y = min_y + tile_size
+    min_z = tile_z * tile_size
+    max_z = min_z + tile_size
+
+    return await get_discovery_viewport(
+        min_x=min_x,
+        max_x=max_x,
+        min_y=min_y,
+        max_y=max_y,
+        min_z=min_z,
+        max_z=max_z,
+        projection_version=projection_version,
+        pad=settings.discovery_viewport_default_pad,
+        max_nodes=max_nodes,
+        max_edges_per_node=max_edges_per_node,
+        min_similarity=min_similarity,
+        lod=lod,
+        include_edges=include_edges,
+        session=session,
+    )
+
+
+# --- Hedge Graph ---
 
 
 @app.get("/market/{market_id}/related", response_model=GraphResponse)
@@ -201,9 +516,8 @@ async def get_related_markets(
     edge_types: str = Query("all", description="Comma-separated edge types or 'all'"),
     session: AsyncSession = Depends(get_async_session),
 ) -> GraphResponse:
-    """Serve high-confidence related markets for hedging and dependency analysis."""
     focal_result = await session.execute(
-        text(f"SELECT {MARKET_COLS} FROM markets m WHERE m.id = :market_id"),
+        text(f"SELECT {MARKET_COLS} FROM markets m {MARKET_JOIN} WHERE m.id = :market_id"),
         {"market_id": market_id},
     )
     focal_row = focal_result.fetchone()
@@ -220,7 +534,8 @@ async def get_related_markets(
         params["edge_types"] = types
 
     edge_result = await session.execute(
-        text(f"""
+        text(
+            f"""
             SELECT source_id, target_id, confidence_score, edge_type,
                    semantic_score, stat_score, logical_score, propagation_score,
                    entity_overlap_score, template_penalty, explanation
@@ -229,32 +544,36 @@ async def get_related_markets(
               AND confidence_score >= :min_conf {type_filter}
             ORDER BY confidence_score DESC
             LIMIT :limit
-        """),
+            """
+        ),
         params,
     )
 
     related_ids: set[str] = set()
-    links: list[GraphLink] = []
-    for erow in edge_result.fetchall():
-        links.append(_edge_row_to_link(erow))
-        if erow[0] != market_id:
-            related_ids.add(erow[0])
-        if erow[1] != market_id:
-            related_ids.add(erow[1])
+    links = [_edge_row_to_link(erow) for erow in edge_result.fetchall()]
+    for link in links:
+        if link.source != market_id:
+            related_ids.add(link.source)
+        if link.target != market_id:
+            related_ids.add(link.target)
 
     nodes: list[MarketNode] = [focal_node]
     if related_ids:
         related_result = await session.execute(
-            text(f"SELECT {MARKET_COLS} FROM markets m WHERE m.id = ANY(:ids)"),
+            text(f"SELECT {MARKET_COLS} FROM markets m {MARKET_JOIN} WHERE m.id = ANY(:ids)"),
             {"ids": list(related_ids)},
         )
-        for row in related_result.fetchall():
-            nodes.append(_row_to_node(row))
+        nodes.extend(_row_to_node(row) for row in related_result.fetchall())
 
     return GraphResponse(
-        nodes=nodes, links=links,
-        meta={"focal_market": market_id, "min_conf": min_conf,
-              "related_count": len(related_ids), "edge_count": len(links)},
+        nodes=nodes,
+        links=links,
+        meta={
+            "focal_market": market_id,
+            "min_conf": min_conf,
+            "related_count": len(related_ids),
+            "edge_count": len(links),
+        },
     )
 
 
@@ -265,7 +584,6 @@ async def get_hedge_graph(
     limit: int = Query(200, ge=1, le=1000, description="Max nodes to return"),
     session: AsyncSession = Depends(get_async_session),
 ) -> GraphResponse:
-    """Serve hedge graph edges computed from statistical + logical dependencies."""
     params: dict[str, Any] = {"limit": limit}
     where_clauses = ["m.is_active = 1.0"]
 
@@ -277,17 +595,14 @@ async def get_hedge_graph(
 
     result = await session.execute(
         text(
-            f"SELECT {MARKET_COLS} FROM markets m WHERE {where_sql} "
+            f"SELECT {MARKET_COLS} FROM markets m {MARKET_JOIN} WHERE {where_sql} "
             "ORDER BY m.volume DESC NULLS LAST LIMIT :limit"
         ),
         params,
     )
 
-    nodes: list[MarketNode] = []
-    node_ids: set[str] = set()
-    for row in result.fetchall():
-        nodes.append(_row_to_node(row))
-        node_ids.add(row[0])
+    nodes = [_row_to_node(row) for row in result.fetchall()]
+    node_ids = [n.id for n in nodes]
 
     links: list[GraphLink] = []
     if node_ids:
@@ -306,10 +621,9 @@ async def get_hedge_graph(
                 LIMIT 1000
                 """
             ),
-            {"min_conf": min_conf, "node_ids": list(node_ids)},
+            {"min_conf": min_conf, "node_ids": node_ids},
         )
-        for erow in edge_result.fetchall():
-            links.append(_edge_row_to_link(erow))
+        links = [_edge_row_to_link(erow) for erow in edge_result.fetchall()]
 
     return GraphResponse(
         nodes=nodes,
@@ -332,9 +646,8 @@ async def get_market(
     market_id: str,
     session: AsyncSession = Depends(get_async_session),
 ) -> MarketDetail:
-    """Get details for a single market."""
     result = await session.execute(
-        text(f"SELECT {MARKET_COLS} FROM markets m WHERE m.id = :market_id"),
+        text(f"SELECT {MARKET_COLS} FROM markets m {MARKET_JOIN} WHERE m.id = :market_id"),
         {"market_id": market_id},
     )
     row = result.fetchone()
@@ -349,21 +662,19 @@ async def get_market_prices(
     hours: int = Query(24, ge=1, le=720, description="Hours of history"),
     session: AsyncSession = Depends(get_async_session),
 ) -> MarketPriceHistory:
-    """Get price history for a market."""
     result = await session.execute(
-        text(f"""
+        text(
+            f"""
             SELECT timestamp, probability, volume
             FROM market_prices
             WHERE market_id = :market_id
               AND timestamp >= NOW() - INTERVAL '{hours} hours'
             ORDER BY timestamp ASC
-        """),
+            """
+        ),
         {"market_id": market_id},
     )
-    prices = [
-        PricePoint(timestamp=row[0], probability=row[1], volume=row[2])
-        for row in result.fetchall()
-    ]
+    prices = [PricePoint(timestamp=row[0], probability=row[1], volume=row[2]) for row in result.fetchall()]
     return MarketPriceHistory(market_id=market_id, prices=prices)
 
 
@@ -378,7 +689,6 @@ async def list_markets(
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_async_session),
 ) -> list[MarketDetail]:
-    """List markets with optional filtering."""
     where_clauses = []
     params: dict[str, Any] = {"limit": limit, "offset": offset}
 
@@ -391,8 +701,10 @@ async def list_markets(
     where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
     result = await session.execute(
-        text(f"SELECT {MARKET_COLS} FROM markets m {where_sql} "
-             "ORDER BY m.volume DESC NULLS LAST LIMIT :limit OFFSET :offset"),
+        text(
+            f"SELECT {MARKET_COLS} FROM markets m {MARKET_JOIN} {where_sql} "
+            "ORDER BY m.volume DESC NULLS LAST LIMIT :limit OFFSET :offset"
+        ),
         params,
     )
     return [_row_to_detail(row) for row in result.fetchall()]
