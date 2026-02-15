@@ -372,6 +372,59 @@ async def get_discovery_graph(
     )
 
 
+@app.get("/graph/discovery/all", response_model=GraphResponse)
+async def get_discovery_graph_all(
+    min_conf: float = Query(0.3, ge=0.0, le=1.0, description="Minimum confidence for edges"),
+    include_edges: bool = Query(True, description="Include discovery edges"),
+    session: AsyncSession = Depends(get_async_session),
+) -> GraphResponse:
+    """Return the full discovery graph (all active markets + discovery edges)."""
+    result = await session.execute(
+        text(
+            f"SELECT {MARKET_COLS} FROM markets m {MARKET_JOIN} "
+            "WHERE m.is_active = 1.0 ORDER BY m.volume DESC NULLS LAST"
+        )
+    )
+
+    nodes = [_row_to_node(row) for row in result.fetchall()]
+    node_ids = [n.id for n in nodes]
+
+    links: list[GraphLink] = []
+    if include_edges and node_ids:
+        edge_result = await session.execute(
+            text(
+                """
+                SELECT source_id, target_id, confidence_score, edge_type,
+                       semantic_score, stat_score, logical_score, propagation_score,
+                       entity_overlap_score, template_penalty, explanation
+                FROM market_edges
+                WHERE edge_type = 'discovery'
+                  AND confidence_score >= :min_conf
+                  AND source_id = ANY(:node_ids)
+                  AND target_id = ANY(:node_ids)
+                ORDER BY confidence_score DESC
+                """
+            ),
+            {"min_conf": min_conf, "node_ids": node_ids},
+        )
+        links = [_edge_row_to_link(erow) for erow in edge_result.fetchall()]
+
+    projection_version = next((n.projection_version for n in nodes if n.projection_version), None)
+
+    return GraphResponse(
+        nodes=nodes,
+        links=links,
+        meta={
+            "scope": "all",
+            "min_conf": min_conf,
+            "include_edges": include_edges,
+            "node_count": len(nodes),
+            "edge_count": len(links),
+            "projection_version": projection_version,
+        },
+    )
+
+
 @app.get("/graph/discovery/viewport", response_model=GraphResponse)
 async def get_discovery_viewport(
     min_x: float = Query(...),
