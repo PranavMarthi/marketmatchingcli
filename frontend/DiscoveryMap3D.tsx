@@ -1,157 +1,115 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import ForceGraph3D from "react-force-graph-3d";
+import { useEffect, useMemo, useState } from "react";
 
-type Node = {
+import PointCloudScene from "./src/components/PointCloudScene";
+import { transformPointsForScene, type RawPoint } from "./src/lib/pointsTransform";
+
+type DiscoveryNodePayload = {
   id: string;
-  label: string;
-  category?: string;
-  volume?: number;
   x?: number;
   y?: number;
   z?: number;
 };
 
-type Link = {
-  source: string;
-  target: string;
-  confidence: number;
-  type: string;
-};
-
-type GraphPayload = {
-  nodes: Node[];
-  links: Link[];
+type DiscoveryPayload = {
+  nodes: DiscoveryNodePayload[];
   meta: Record<string, unknown>;
 };
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = (import.meta.env.VITE_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 
-function dedupeNodes(nodes: Node[]): Node[] {
-  const byId = new Map<string, Node>();
-  for (const n of nodes) {
-    byId.set(n.id, { ...(byId.get(n.id) || {}), ...n });
-  }
-  return [...byId.values()];
-}
+const DEFAULT_POINT_SIZE = 0.02;
 
-function dedupeLinks(links: Link[]): Link[] {
-  const byKey = new Map<string, Link>();
-  for (const l of links) {
-    const s = typeof l.source === "string" ? l.source : String(l.source);
-    const t = typeof l.target === "string" ? l.target : String(l.target);
-    const key = `${s}|${t}|${l.type}`;
-    const prev = byKey.get(key);
-    if (!prev || l.confidence > prev.confidence) {
-      byKey.set(key, l);
-    }
-  }
-  return [...byKey.values()];
+function mapToRawPoint(node: DiscoveryNodePayload): RawPoint {
+  return {
+    id: node.id,
+    x: node.x,
+    y: node.y,
+    z: node.z
+  };
 }
 
 export default function DiscoveryMap3D(): JSX.Element {
-  const fgRef = useRef<any>(null);
-  const [graph, setGraph] = useState<GraphPayload>({ nodes: [], links: [], meta: {} });
-  const [selectedNode, setSelectedNode] = useState<Node | null>(null);
-  const [hedgeLinks, setHedgeLinks] = useState<Link[]>([]);
-  const [minHedgeConf, setMinHedgeConf] = useState(0.7);
-
-  const refreshViewport = useCallback(async () => {
-    const camera = fgRef.current?.camera?.();
-    if (!camera) return;
-
-    const scale = Math.max(0.5, Math.min(5, camera.position.length() / 300));
-    const span = 8 * scale;
-
-    const minX = camera.position.x - span;
-    const maxX = camera.position.x + span;
-    const minY = camera.position.y - span;
-    const maxY = camera.position.y + span;
-    const minZ = camera.position.z - span;
-    const maxZ = camera.position.z + span;
-
-    const lod = scale > 2 ? "far" : scale > 1 ? "mid" : "near";
-    const url = new URL(`${API_BASE}/graph/discovery/viewport`);
-    url.searchParams.set("min_x", `${minX}`);
-    url.searchParams.set("max_x", `${maxX}`);
-    url.searchParams.set("min_y", `${minY}`);
-    url.searchParams.set("max_y", `${maxY}`);
-    url.searchParams.set("min_z", `${minZ}`);
-    url.searchParams.set("max_z", `${maxZ}`);
-    url.searchParams.set("lod", lod);
-    url.searchParams.set("max_nodes", "2500");
-    url.searchParams.set("max_edges_per_node", lod === "far" ? "4" : lod === "mid" ? "8" : "15");
-    url.searchParams.set("min_similarity", "0.55");
-
-    const res = await fetch(url.toString());
-    if (!res.ok) return;
-    const payload = (await res.json()) as GraphPayload;
-
-    setGraph((prev) => ({
-      nodes: dedupeNodes([...prev.nodes, ...payload.nodes]),
-      links: dedupeLinks([...prev.links, ...payload.links]),
-      meta: payload.meta,
-    }));
-  }, []);
+  const [points, setPoints] = useState<RawPoint[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const id = setTimeout(() => {
-      void refreshViewport();
-    }, 400);
-    return () => clearTimeout(id);
-  }, [refreshViewport]);
+    const controller = new AbortController();
+    setLoading(true);
+    setError(null);
 
-  const onNodeClick = useCallback(
-    async (node: Node) => {
-      setSelectedNode(node);
-      const url = new URL(`${API_BASE}/market/${node.id}/related`);
-      url.searchParams.set("edge_types", "hedge");
-      url.searchParams.set("min_conf", `${minHedgeConf}`);
-      url.searchParams.set("limit", "40");
+    const load = async () => {
+      try {
+        const url = new URL(`${API_BASE}/graph/discovery/all`);
+        url.searchParams.set("include_edges", "false");
 
-      const res = await fetch(url.toString());
-      if (!res.ok) return;
-      const payload = (await res.json()) as GraphPayload;
-      setHedgeLinks(payload.links || []);
-    },
-    [minHedgeConf]
-  );
+        const res = await fetch(url.toString(), { signal: controller.signal });
+        if (!res.ok) {
+          throw new Error(`request failed (${res.status})`);
+        }
 
-  const mergedLinks = useMemo(() => {
-    const overlay = hedgeLinks.map((l) => ({ ...l, type: "hedge" }));
-    return dedupeLinks([...graph.links, ...overlay]);
-  }, [graph.links, hedgeLinks]);
+        const payload = (await res.json()) as DiscoveryPayload;
+        const rawPoints = (payload.nodes || []).map(mapToRawPoint);
+        setPoints(rawPoints);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          return;
+        }
+        console.error("point cloud fetch failed", err);
+        setError(err instanceof Error ? err.message : "unknown fetch error");
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    void load();
+    return () => controller.abort();
+  }, []);
+
+  const transformed = useMemo(() => transformPointsForScene(points), [points]);
+  const pointSize = DEFAULT_POINT_SIZE;
 
   return (
-    <div style={{ width: "100vw", height: "100vh", background: "#0c1118" }}>
-      <div style={{ position: "absolute", zIndex: 10, left: 12, top: 12, color: "#d8e2f0" }}>
-        <div>Projection: {String(graph.meta?.projection_version || "none")}</div>
-        <div>
-          Hedge min conf:
-          <input
-            type="range"
-            min={0.3}
-            max={0.95}
-            step={0.05}
-            value={minHedgeConf}
-            onChange={(e) => setMinHedgeConf(Number(e.target.value))}
-          />
-          {minHedgeConf.toFixed(2)}
-        </div>
-        {selectedNode && <div>Selected: {selectedNode.label}</div>}
+    <div style={{ width: "100vw", height: "100vh", position: "relative", background: "#05060a" }}>
+      <div
+        style={{
+          position: "absolute",
+          top: 48,
+          left: 56,
+          zIndex: 20,
+          color: "#eef3ff",
+          fontSize: 24,
+          letterSpacing: "0.04em",
+          fontFamily:
+            '"GT Standard Mono", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+          textShadow: "0 0 14px rgba(210, 225, 255, 0.35)",
+          pointerEvents: "none"
+        }}
+      >
+        PolySpace
       </div>
 
-      <ForceGraph3D
-        ref={fgRef}
-        graphData={{ nodes: graph.nodes, links: mergedLinks }}
-        nodeId="id"
-        nodeLabel={(n: any) => n.label || n.id}
-        nodeAutoColorBy="category"
-        nodeVal={(n: any) => Math.max(1, Math.log10((n.volume || 1) + 1))}
-        linkColor={(l: any) => (l.type === "hedge" ? "#ff6f61" : "#6ec1ff")}
-        linkOpacity={0.45}
-        onNodeClick={onNodeClick}
-        onEngineStop={() => void refreshViewport()}
+      <PointCloudScene
+        positions={transformed.positions}
+        pointCount={transformed.pointCount}
+        suggestedCameraDistance={transformed.suggestedCameraDistance}
+        pointSize={pointSize}
       />
+      {(loading || error) && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 12,
+            left: 12,
+            color: "#95a6c8",
+            fontSize: 12,
+            opacity: 0.72,
+            pointerEvents: "none"
+          }}
+        >
+          {loading ? "loading points..." : `error: ${error}`}
+        </div>
+      )}
     </div>
   );
 }

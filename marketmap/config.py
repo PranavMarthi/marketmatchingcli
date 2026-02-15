@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     celery_broker_url: str = "redis://localhost:6379/1"
 
+    # Memgraph
+    memgraph_enabled: bool = True
+    memgraph_uri: str = "bolt://localhost:7687"
+    memgraph_username: str = ""
+    memgraph_password: str = ""
+
     # Polymarket
     polymarket_gamma_base_url: str = "https://gamma-api.polymarket.com"
     polymarket_clob_base_url: str = "https://clob.polymarket.com"

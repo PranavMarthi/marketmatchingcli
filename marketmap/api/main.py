@@ -22,6 +22,7 @@ from marketmap.api.schemas import (
 )
 from marketmap.config import settings
 from marketmap.models.database import get_async_session
+from marketmap.services.memgraph import fetch_discovery_graph, memgraph_is_available
 
 logger = logging.getLogger(__name__)
 
@@ -379,6 +380,10 @@ async def get_discovery_graph_all(
     session: AsyncSession = Depends(get_async_session),
 ) -> GraphResponse:
     """Return the full discovery graph (all active markets + discovery edges)."""
+    if settings.memgraph_enabled and memgraph_is_available():
+        payload = fetch_discovery_graph(min_conf=min_conf, include_edges=include_edges)
+        return GraphResponse(**payload)
+
     result = await session.execute(
         text(
             f"SELECT {MARKET_COLS} FROM markets m {MARKET_JOIN} "
@@ -421,6 +426,7 @@ async def get_discovery_graph_all(
             "node_count": len(nodes),
             "edge_count": len(links),
             "projection_version": projection_version,
+            "source": "postgres",
         },
     )
 

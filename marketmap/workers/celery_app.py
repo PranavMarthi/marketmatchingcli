@@ -17,6 +17,7 @@ app = Celery(
         "marketmap.workers.entity_worker",
         "marketmap.workers.hedge_worker",
         "marketmap.workers.projection_worker",
+        "marketmap.workers.memgraph_sync_worker",
     ],
 )
 
@@ -72,6 +73,11 @@ app.conf.beat_schedule = {
     "compute-3d-projection-daily": {
         "task": "marketmap.workers.projection_worker.compute_market_projection_3d",
         "schedule": crontab(hour=4, minute=0),
+        "options": {"queue": "default"},
+    },
+    "sync-memgraph-discovery-daily": {
+        "task": "marketmap.workers.memgraph_sync_worker.sync_memgraph_discovery",
+        "schedule": crontab(hour=4, minute=30),
         "options": {"queue": "default"},
     },
 }
