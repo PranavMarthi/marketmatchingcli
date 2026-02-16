@@ -26,6 +26,8 @@ class MarketNode(BaseModel):
     y: float | None = None
     z: float | None = None
     projection_version: str | None = None
+    cluster_id: str | None = None
+    distortion_score: float | None = None
 
 
 class GraphLink(BaseModel):
@@ -74,6 +76,8 @@ class MarketDetail(BaseModel):
     y: float | None = None
     z: float | None = None
     projection_version: str | None = None
+    cluster_id: str | None = None
+    distortion_score: float | None = None
 
 
 class PricePoint(BaseModel):

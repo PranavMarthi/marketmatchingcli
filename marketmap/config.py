@@ -7,12 +7,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # Database (Postgres.app PG18 on port 5412)
-    database_url: str = (
-        "postgresql+asyncpg://postgres@localhost:5412/marketmap"
-    )
-    database_url_sync: str = (
-        "postgresql://postgres@localhost:5412/marketmap"
-    )
+    database_url: str = "postgresql+asyncpg://postgres@localhost:5412/marketmap"
+    database_url_sync: str = "postgresql://postgres@localhost:5412/marketmap"
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
@@ -60,6 +56,12 @@ class Settings(BaseSettings):
     discovery_viewport_default_max_edges_per_node: int = 15
     discovery_viewport_default_pad: float = 0.15
     discovery_viewport_cache_ttl_seconds: int = 60
+    discovery_cluster_min_confidence: float = 0.35
+    discovery_cluster_resolution: float = 1.0
+    discovery_cluster_seed: int = 1337
+
+    # Projection distortion scoring
+    projection_distortion_k_neighbors: int = 10
 
     # Worker cadences (seconds)
     market_ingestion_interval_seconds: int = 300  # 5 min

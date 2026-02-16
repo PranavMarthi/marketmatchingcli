@@ -15,7 +15,9 @@ from marketmap.workers.celery_app import app
 logger = logging.getLogger(__name__)
 
 
-@app.task(bind=True, name="marketmap.workers.memgraph_sync_worker.sync_memgraph_discovery", max_retries=2)
+@app.task(
+    bind=True, name="marketmap.workers.memgraph_sync_worker.sync_memgraph_discovery", max_retries=2
+)
 def sync_memgraph_discovery(self, min_conf: float = 0.3) -> dict:  # type: ignore[type-arg]
     """Export active markets + discovery edges from Postgres into Memgraph."""
     if not settings.memgraph_enabled:
@@ -24,9 +26,10 @@ def sync_memgraph_discovery(self, min_conf: float = 0.3) -> dict:  # type: ignor
     start = datetime.now(timezone.utc)
     session = SyncSessionLocal()
     try:
-        node_rows = session.execute(
-            text(
-                """
+        node_rows = (
+            session.execute(
+                text(
+                    """
                 SELECT m.id,
                        m.title,
                        m.link,
@@ -42,18 +45,30 @@ def sync_memgraph_discovery(self, min_conf: float = 0.3) -> dict:  # type: ignor
                        p.x,
                        p.y,
                        p.z,
-                       p.projection_version
+                       p.projection_version,
+                       mc.cluster_id,
+                       mpd.distortion_score
                 FROM markets m
                 LEFT JOIN market_projection_3d p ON p.market_id = m.id
+                LEFT JOIN market_clusters mc
+                  ON mc.market_id = m.id
+                 AND mc.projection_version = p.projection_version
+                LEFT JOIN market_projection_distortion mpd
+                  ON mpd.market_id = m.id
+                 AND mpd.projection_version = p.projection_version
                 WHERE m.is_active = 1.0
                 ORDER BY m.volume DESC NULLS LAST
                 """
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
 
-        edge_rows = session.execute(
-            text(
-                """
+        edge_rows = (
+            session.execute(
+                text(
+                    """
                 SELECT source_id,
                        target_id,
                        confidence_score,
@@ -69,9 +84,12 @@ def sync_memgraph_discovery(self, min_conf: float = 0.3) -> dict:  # type: ignor
                   AND confidence_score >= :min_conf
                 ORDER BY confidence_score DESC
                 """
-            ),
-            {"min_conf": min_conf},
-        ).mappings().all()
+                ),
+                {"min_conf": min_conf},
+            )
+            .mappings()
+            .all()
+        )
 
         payload_nodes = [
             {
@@ -88,6 +106,8 @@ def sync_memgraph_discovery(self, min_conf: float = 0.3) -> dict:  # type: ignor
                 "y": r["y"],
                 "z": r["z"],
                 "projection_version": r["projection_version"],
+                "cluster_id": r["cluster_id"],
+                "distortion_score": r["distortion_score"],
             }
             for r in node_rows
         ]

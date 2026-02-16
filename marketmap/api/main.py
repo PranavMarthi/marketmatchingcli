@@ -87,6 +87,8 @@ def _row_to_node(row) -> MarketNode:  # type: ignore[no-untyped-def]
         y=row[12],
         z=row[13],
         projection_version=row[14],
+        cluster_id=None,
+        distortion_score=None,
     )
 
 
@@ -107,6 +109,8 @@ def _row_to_detail(row) -> MarketDetail:  # type: ignore[no-untyped-def]
         y=row[12],
         z=row[13],
         projection_version=row[14],
+        cluster_id=None,
+        distortion_score=None,
     )
 
 
@@ -139,6 +143,104 @@ async def _latest_projection_version(session: AsyncSession) -> str | None:
         )
     )
     return result.scalar()
+
+
+async def _attach_cluster_ids(session: AsyncSession, nodes: list[MarketNode]) -> None:
+    """Attach cluster_id to nodes based on latest clustering for projection version."""
+    if not nodes:
+        return
+
+    projection_version = next((n.projection_version for n in nodes if n.projection_version), None)
+    if not projection_version:
+        return
+
+    node_ids = [n.id for n in nodes]
+    rows = await session.execute(
+        text(
+            """
+            SELECT market_id, cluster_id
+            FROM market_clusters
+            WHERE projection_version = :projection_version
+              AND market_id = ANY(:node_ids)
+            """
+        ),
+        {"projection_version": projection_version, "node_ids": node_ids},
+    )
+    cluster_map = {row[0]: row[1] for row in rows.fetchall()}
+    for node in nodes:
+        node.cluster_id = cluster_map.get(node.id)
+
+
+async def _attach_cluster_ids_to_details(session: AsyncSession, items: list[MarketDetail]) -> None:
+    if not items:
+        return
+    projection_version = next((i.projection_version for i in items if i.projection_version), None)
+    if not projection_version:
+        return
+    market_ids = [i.id for i in items]
+    rows = await session.execute(
+        text(
+            """
+            SELECT market_id, cluster_id
+            FROM market_clusters
+            WHERE projection_version = :projection_version
+              AND market_id = ANY(:market_ids)
+            """
+        ),
+        {"projection_version": projection_version, "market_ids": market_ids},
+    )
+    cluster_map = {row[0]: row[1] for row in rows.fetchall()}
+    for item in items:
+        item.cluster_id = cluster_map.get(item.id)
+
+
+async def _attach_distortion_scores(session: AsyncSession, nodes: list[MarketNode]) -> None:
+    """Attach distortion_score to nodes for the relevant projection version."""
+    if not nodes:
+        return
+    projection_version = next((n.projection_version for n in nodes if n.projection_version), None)
+    if not projection_version:
+        return
+    node_ids = [n.id for n in nodes]
+    rows = await session.execute(
+        text(
+            """
+            SELECT market_id, distortion_score
+            FROM market_projection_distortion
+            WHERE projection_version = :projection_version
+              AND market_id = ANY(:node_ids)
+            """
+        ),
+        {"projection_version": projection_version, "node_ids": node_ids},
+    )
+    score_map = {row[0]: row[1] for row in rows.fetchall()}
+    for node in nodes:
+        node.distortion_score = score_map.get(node.id)
+
+
+async def _attach_distortion_scores_to_details(
+    session: AsyncSession, items: list[MarketDetail]
+) -> None:
+    if not items:
+        return
+    projection_version = next((i.projection_version for i in items if i.projection_version), None)
+    if not projection_version:
+        return
+    market_ids = [i.id for i in items]
+    rows = await session.execute(
+        text(
+            """
+            SELECT market_id, distortion_score
+            FROM market_projection_distortion
+            WHERE projection_version = :projection_version
+              AND market_id = ANY(:market_ids)
+            """
+        ),
+        {"projection_version": projection_version, "market_ids": market_ids},
+    )
+    score_map = {row[0]: row[1] for row in rows.fetchall()}
+    for item in items:
+        item.distortion_score = score_map.get(item.id)
 
 
 def _lod_limits(lod: str, max_nodes: int, max_edges_per_node: int) -> tuple[str, int, int]:
@@ -227,6 +329,8 @@ async def _build_discovery_viewport(
     )
 
     nodes = [_row_to_node(row) for row in node_result.fetchall()]
+    await _attach_cluster_ids(session, nodes)
+    await _attach_distortion_scores(session, nodes)
     node_ids = [n.id for n in nodes]
 
     links: list[GraphLink] = []
@@ -335,6 +439,8 @@ async def get_discovery_graph(
     )
 
     nodes = [_row_to_node(row) for row in result.fetchall()]
+    await _attach_cluster_ids(session, nodes)
+    await _attach_distortion_scores(session, nodes)
     node_ids = [n.id for n in nodes]
 
     links: list[GraphLink] = []
@@ -382,6 +488,85 @@ async def get_discovery_graph_all(
     """Return the full discovery graph (all active markets + discovery edges)."""
     if settings.memgraph_enabled and memgraph_is_available():
         payload = fetch_discovery_graph(min_conf=min_conf, include_edges=include_edges)
+        nodes_payload = payload.get("nodes", [])
+        projection_version = payload.get("meta", {}).get("projection_version")
+        if isinstance(nodes_payload, list):
+            missing_clusters = any(
+                node.get("cluster_id") is None for node in nodes_payload if isinstance(node, dict)
+            )
+            missing_distortion = any(
+                node.get("distortion_score") is None
+                for node in nodes_payload
+                if isinstance(node, dict)
+            )
+            if missing_clusters or missing_distortion:
+                node_ids = [
+                    node.get("id")
+                    for node in nodes_payload
+                    if isinstance(node, dict) and node.get("id")
+                ]
+                if node_ids:
+                    cluster_map: dict[str, str] = {}
+                    distortion_map: dict[str, float] = {}
+                    if projection_version:
+                        rows = await session.execute(
+                            text(
+                                """
+                                SELECT market_id, cluster_id
+                                FROM market_clusters
+                                WHERE projection_version = :projection_version
+                                  AND market_id = ANY(:node_ids)
+                                """
+                            ),
+                            {"projection_version": projection_version, "node_ids": node_ids},
+                        )
+                        cluster_map = {row[0]: row[1] for row in rows.fetchall()}
+                        distortion_rows = await session.execute(
+                            text(
+                                """
+                                SELECT market_id, distortion_score
+                                FROM market_projection_distortion
+                                WHERE projection_version = :projection_version
+                                  AND market_id = ANY(:node_ids)
+                                """
+                            ),
+                            {"projection_version": projection_version, "node_ids": node_ids},
+                        )
+                        distortion_map = {row[0]: row[1] for row in distortion_rows.fetchall()}
+                    if not cluster_map:
+                        latest_rows = await session.execute(
+                            text(
+                                """
+                                SELECT DISTINCT ON (market_id) market_id, cluster_id
+                                FROM market_clusters
+                                WHERE market_id = ANY(:node_ids)
+                                ORDER BY market_id, updated_at DESC
+                                """
+                            ),
+                            {"node_ids": node_ids},
+                        )
+                        cluster_map = {row[0]: row[1] for row in latest_rows.fetchall()}
+                    if not distortion_map:
+                        latest_distortion_rows = await session.execute(
+                            text(
+                                """
+                                SELECT DISTINCT ON (market_id) market_id, distortion_score
+                                FROM market_projection_distortion
+                                WHERE market_id = ANY(:node_ids)
+                                ORDER BY market_id, updated_at DESC
+                                """
+                            ),
+                            {"node_ids": node_ids},
+                        )
+                        distortion_map = {
+                            row[0]: row[1] for row in latest_distortion_rows.fetchall()
+                        }
+                    for node in nodes_payload:
+                        if isinstance(node, dict):
+                            market_id = node.get("id")
+                            if market_id:
+                                node["cluster_id"] = cluster_map.get(market_id)
+                                node["distortion_score"] = distortion_map.get(market_id)
         return GraphResponse(**payload)
 
     result = await session.execute(
@@ -392,6 +577,8 @@ async def get_discovery_graph_all(
     )
 
     nodes = [_row_to_node(row) for row in result.fetchall()]
+    await _attach_cluster_ids(session, nodes)
+    await _attach_distortion_scores(session, nodes)
     node_ids = [n.id for n in nodes]
 
     links: list[GraphLink] = []
@@ -442,7 +629,9 @@ async def get_discovery_viewport(
     projection_version: str | None = Query(None),
     pad: float = Query(settings.discovery_viewport_default_pad, ge=0.0, le=1.0),
     max_nodes: int = Query(settings.discovery_viewport_default_max_nodes, ge=50, le=5000),
-    max_edges_per_node: int = Query(settings.discovery_viewport_default_max_edges_per_node, ge=1, le=30),
+    max_edges_per_node: int = Query(
+        settings.discovery_viewport_default_max_edges_per_node, ge=1, le=30
+    ),
     min_similarity: float = Query(0.55, ge=0.0, le=1.0),
     lod: str = Query("auto"),
     include_edges: bool = Query(True),
@@ -469,7 +658,9 @@ async def get_discovery_viewport(
     min_z_pad = z_min - (span_z * pad)
     max_z_pad = z_max + (span_z * pad)
 
-    lod_resolved, max_nodes_resolved, max_edges_resolved = _lod_limits(lod, max_nodes, max_edges_per_node)
+    lod_resolved, max_nodes_resolved, max_edges_resolved = _lod_limits(
+        lod, max_nodes, max_edges_per_node
+    )
 
     redis_client = _get_redis_client()
     cache_key = _cache_key_for_viewport(
@@ -491,7 +682,7 @@ async def get_discovery_viewport(
         try:
             cached = redis_client.get(cache_key)
             if cached:
-                payload = json.loads(cached)
+                payload = json.loads(str(cached))
                 return GraphResponse(**payload)
         except Exception:
             logger.warning("Redis cache read failed", exc_info=True)
@@ -536,7 +727,9 @@ async def get_discovery_tile(
     include_edges: bool = Query(True),
     min_similarity: float = Query(0.55, ge=0.0, le=1.0),
     max_nodes: int = Query(settings.discovery_viewport_default_max_nodes, ge=50, le=5000),
-    max_edges_per_node: int = Query(settings.discovery_viewport_default_max_edges_per_node, ge=1, le=30),
+    max_edges_per_node: int = Query(
+        settings.discovery_viewport_default_max_edges_per_node, ge=1, le=30
+    ),
     session: AsyncSession = Depends(get_async_session),
 ) -> GraphResponse:
     min_x = tile_x * tile_size
@@ -623,6 +816,8 @@ async def get_related_markets(
             {"ids": list(related_ids)},
         )
         nodes.extend(_row_to_node(row) for row in related_result.fetchall())
+    await _attach_cluster_ids(session, nodes)
+    await _attach_distortion_scores(session, nodes)
 
     return GraphResponse(
         nodes=nodes,
@@ -661,6 +856,8 @@ async def get_hedge_graph(
     )
 
     nodes = [_row_to_node(row) for row in result.fetchall()]
+    await _attach_cluster_ids(session, nodes)
+    await _attach_distortion_scores(session, nodes)
     node_ids = [n.id for n in nodes]
 
     links: list[GraphLink] = []
@@ -712,7 +909,10 @@ async def get_market(
     row = result.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Market not found")
-    return _row_to_detail(row)
+    detail = _row_to_detail(row)
+    await _attach_cluster_ids_to_details(session, [detail])
+    await _attach_distortion_scores_to_details(session, [detail])
+    return detail
 
 
 @app.get("/market/{market_id}/prices", response_model=MarketPriceHistory)
@@ -733,7 +933,9 @@ async def get_market_prices(
         ),
         {"market_id": market_id},
     )
-    prices = [PricePoint(timestamp=row[0], probability=row[1], volume=row[2]) for row in result.fetchall()]
+    prices = [
+        PricePoint(timestamp=row[0], probability=row[1], volume=row[2]) for row in result.fetchall()
+    ]
     return MarketPriceHistory(market_id=market_id, prices=prices)
 
 
@@ -766,4 +968,7 @@ async def list_markets(
         ),
         params,
     )
-    return [_row_to_detail(row) for row in result.fetchall()]
+    details = [_row_to_detail(row) for row in result.fetchall()]
+    await _attach_cluster_ids_to_details(session, details)
+    await _attach_distortion_scores_to_details(session, details)
+    return details

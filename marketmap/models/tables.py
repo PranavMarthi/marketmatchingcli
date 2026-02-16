@@ -7,6 +7,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Float,
+    Integer,
     Index,
     String,
     Text,
@@ -61,9 +62,7 @@ class MarketPrice(Base):
     probability = Column(Float, nullable=False)
     volume = Column(Float, nullable=True)
 
-    __table_args__ = (
-        Index("idx_market_prices_market_time", "market_id", timestamp.desc()),
-    )
+    __table_args__ = (Index("idx_market_prices_market_time", "market_id", timestamp.desc()),)
 
 
 class MarketEmbedding(Base):
@@ -166,3 +165,40 @@ class DiscoveryTilesCache(Base):
     projection_version = Column(String, nullable=False, index=True)
     payload_json = Column(JSONB, nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class MarketCluster(Base):
+    """Persisted discovery-cluster assignment per projection version."""
+
+    __tablename__ = "market_clusters"
+
+    market_id = Column(String, primary_key=True)
+    projection_version = Column(String, primary_key=True)
+    clustering_version = Column(String, nullable=False, index=True)
+    cluster_id = Column(String, nullable=False, index=True)
+    cluster_size = Column(Float, nullable=False)
+    algorithm = Column(String, nullable=False, default="louvain")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_market_clusters_proj_cluster", "projection_version", "cluster_id"),
+        Index("idx_market_clusters_market_proj", "market_id", "projection_version"),
+    )
+
+
+class MarketProjectionDistortion(Base):
+    """Per-market distortion metrics comparing embedding and projected neighborhoods."""
+
+    __tablename__ = "market_projection_distortion"
+
+    market_id = Column(String, primary_key=True)
+    projection_version = Column(String, primary_key=True)
+    distortion_version = Column(String, nullable=False, index=True)
+    neighbor_k = Column(Integer, nullable=False)
+    distortion_score = Column(Float, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_market_projection_distortion_proj", "projection_version"),
+        Index("idx_market_projection_distortion_market_proj", "market_id", "projection_version"),
+    )

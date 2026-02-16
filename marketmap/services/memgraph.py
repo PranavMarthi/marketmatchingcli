@@ -53,7 +53,9 @@ def fetch_discovery_graph(min_conf: float = 0.3, include_edges: bool = True) -> 
                        m.x AS x,
                        m.y AS y,
                        m.z AS z,
-                       m.projection_version AS projection_version
+                       m.projection_version AS projection_version,
+                       m.cluster_id AS cluster_id,
+                       m.distortion_score AS distortion_score
                 """
             )
             nodes = [
@@ -72,6 +74,8 @@ def fetch_discovery_graph(min_conf: float = 0.3, include_edges: bool = True) -> 
                     "y": r["y"],
                     "z": r["z"],
                     "projection_version": r["projection_version"],
+                    "cluster_id": r["cluster_id"],
+                    "distortion_score": r["distortion_score"],
                 }
                 for r in nodes_rows
             ]
@@ -115,7 +119,9 @@ def fetch_discovery_graph(min_conf: float = 0.3, include_edges: bool = True) -> 
                     for r in edge_rows
                 ]
 
-    projection_version = next((n.get("projection_version") for n in nodes if n.get("projection_version")), None)
+    projection_version = next(
+        (n.get("projection_version") for n in nodes if n.get("projection_version")), None
+    )
     return {
         "nodes": nodes,
         "links": links,
@@ -131,7 +137,9 @@ def fetch_discovery_graph(min_conf: float = 0.3, include_edges: bool = True) -> 
     }
 
 
-def sync_discovery_graph(nodes: Iterable[dict[str, Any]], edges: Iterable[dict[str, Any]]) -> dict[str, int]:
+def sync_discovery_graph(
+    nodes: Iterable[dict[str, Any]], edges: Iterable[dict[str, Any]]
+) -> dict[str, int]:
     """Replace Memgraph Market + DISCOVERY graph from iterable rows."""
     with _driver() as driver:
         with driver.session() as session:
@@ -155,7 +163,9 @@ def sync_discovery_graph(nodes: Iterable[dict[str, Any]], edges: Iterable[dict[s
                         x: row.x,
                         y: row.y,
                         z: row.z,
-                        projection_version: row.projection_version
+                        projection_version: row.projection_version,
+                        cluster_id: row.cluster_id,
+                        distortion_score: row.distortion_score
                     })
                     """,
                     rows=batch_nodes,
