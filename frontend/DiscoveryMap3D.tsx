@@ -34,7 +34,8 @@ type DiscoveryPayload = {
 };
 
 const API_BASE = (import.meta.env.VITE_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
-const DEFAULT_POINT_SIZE = 0.187;
+const DEFAULT_POINT_SIZE = 0.26;
+const EDGE_MIN_CONF_ATTEMPTS = [0.35, 0.2, 0.1, 0.05] as const;
 
 function mapToRawPoint(node: DiscoveryNodePayload): RawPoint {
   return {
@@ -60,6 +61,8 @@ export default function DiscoveryMap3D(): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [labelById, setLabelById] = useState<Map<string, string>>(new Map());
+  const [nodeById, setNodeById] = useState<Map<string, DiscoveryNodePayload>>(new Map());
+  const [edgeMinConfUsed, setEdgeMinConfUsed] = useState<number>(EDGE_MIN_CONF_ATTEMPTS[0]);
   const colorBy: "neighborhood" = "neighborhood";
   const intraClusterScale = 1.25;
   const macroSeparation = 1.22;
@@ -71,27 +74,41 @@ export default function DiscoveryMap3D(): JSX.Element {
 
     const load = async () => {
       try {
-        const url = new URL(`${API_BASE}/graph/discovery/all`);
-        url.searchParams.set("include_edges", "true");
-        url.searchParams.set("include_local", "true");
-        url.searchParams.set("entity", "events");
-        url.searchParams.set("min_conf", "0.35");
+        let payload: DiscoveryPayload | null = null;
 
-        const res = await fetch(url.toString(), { signal: controller.signal });
-        if (!res.ok) {
-          throw new Error(`request failed (${res.status})`);
+        for (const minConf of EDGE_MIN_CONF_ATTEMPTS) {
+          const url = new URL(`${API_BASE}/graph/discovery/all`);
+          url.searchParams.set("include_edges", "true");
+          url.searchParams.set("include_local", "true");
+          url.searchParams.set("entity", "events");
+          url.searchParams.set("min_conf", String(minConf));
+
+          const res = await fetch(url.toString(), { signal: controller.signal });
+          if (!res.ok) {
+            throw new Error(`request failed (${res.status})`);
+          }
+
+          const nextPayload = (await res.json()) as DiscoveryPayload;
+          payload = nextPayload;
+          setEdgeMinConfUsed(minConf);
+
+          const linkCount = Array.isArray(nextPayload.links) ? nextPayload.links.length : 0;
+          if (linkCount > 0) break;
         }
 
-        const payload = (await res.json()) as DiscoveryPayload;
+        if (!payload) throw new Error("empty payload");
         const rawPoints = (payload.nodes || []).map(mapToRawPoint);
         setPoints(rawPoints);
         setLinks(Array.isArray(payload.links) ? payload.links : []);
 
         const labels = new Map<string, string>();
+        const nodes = new Map<string, DiscoveryNodePayload>();
         for (const node of payload.nodes || []) {
           labels.set(node.id, node.label || node.id);
+          nodes.set(node.id, node);
         }
         setLabelById(labels);
+        setNodeById(nodes);
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") {
           return;
@@ -156,6 +173,33 @@ export default function DiscoveryMap3D(): JSX.Element {
   };
   const selectedQuestion = selectedId ? labelById.get(selectedId) ?? selectedId : null;
 
+  const selectedRelated = useMemo(() => {
+    if (!selectedId) return [] as Array<{ id: string; label: string; confidence: number }>;
+    const list: Array<{ id: string; label: string; confidence: number }> = [];
+    for (const edge of links) {
+      const isSource = edge.source === selectedId;
+      const isTarget = edge.target === selectedId;
+      if (!isSource && !isTarget) continue;
+      const otherId = isSource ? edge.target : edge.source;
+      const confidenceRaw = edge.confidence ?? edge.weight ?? 0;
+      const confidence = Number.isFinite(confidenceRaw) ? Math.max(0, Math.min(1, confidenceRaw)) : 0;
+      list.push({ id: otherId, label: labelById.get(otherId) ?? otherId, confidence });
+    }
+    list.sort((a, b) => b.confidence - a.confidence || a.label.localeCompare(b.label));
+
+    const deduped: Array<{ id: string; label: string; confidence: number }> = [];
+    const seen = new Set<string>();
+    for (const item of list) {
+      if (seen.has(item.id)) continue;
+      seen.add(item.id);
+      deduped.push(item);
+      if (deduped.length >= 12) break;
+    }
+    return deduped;
+  }, [selectedId, links, labelById]);
+
+  const selectedNode = selectedId ? nodeById.get(selectedId) ?? null : null;
+
   return (
     <div style={{ width: "100vw", height: "100vh", position: "relative", background: "#05060a" }}>
       <div
@@ -190,20 +234,51 @@ export default function DiscoveryMap3D(): JSX.Element {
         <div
           style={{
             position: "absolute",
-            left: 24,
-            bottom: 24,
-            maxWidth: 640,
-            padding: "7px 10px",
-            borderRadius: 8,
-            background: "rgba(8, 12, 20, 0.84)",
-            border: "1px solid rgba(170, 190, 230, 0.22)",
+            right: 24,
+            top: 86,
+            width: "min(780px, calc(100vw - 48px))",
+            maxHeight: "72vh",
+            overflowY: "auto",
+            padding: "18px 20px",
+            borderRadius: 14,
+            background: "linear-gradient(180deg, rgba(7,11,19,0.93), rgba(7,12,20,0.86))",
+            border: "1px solid rgba(146, 174, 221, 0.28)",
+            boxShadow: "0 10px 34px rgba(0, 0, 0, 0.35)",
             color: "#e9f0ff",
-            fontSize: 11,
-            lineHeight: 1.35,
+            fontSize: 16,
+            lineHeight: 1.45,
             zIndex: 30,
           }}
         >
-          <div>{selectedQuestion}</div>
+          <div style={{ fontSize: 42, lineHeight: 1, marginBottom: 10 }}>?</div>
+          <div
+            style={{
+              fontSize: 40,
+              fontWeight: 600,
+              lineHeight: 1.14,
+              marginBottom: 14,
+              color: "#f2f6ff",
+            }}
+          >
+            {selectedQuestion}
+          </div>
+          <div style={{ opacity: 0.8, fontSize: 18, marginBottom: 12 }}>{selectedId}</div>
+          <div style={{ opacity: 0.9, fontSize: 20, marginBottom: 18 }}>
+            {`tags: ${selectedNode?.neighborhood_label || selectedNode?.neighborhood_key || "none"}`}
+          </div>
+
+          <div style={{ fontSize: 30, marginBottom: 10, color: "#eaf2ff" }}>related nodes:</div>
+          <div style={{ display: "grid", gap: 6 }}>
+            {selectedRelated.length === 0 ? (
+              <div style={{ opacity: 0.75 }}>none</div>
+            ) : (
+              selectedRelated.map((item) => (
+                <div key={item.id} style={{ fontSize: 36, lineHeight: 1.12, color: "#f4f7ff" }}>
+                  {item.label}
+                </div>
+              ))
+            )}
+          </div>
         </div>
       )}
 
@@ -219,6 +294,21 @@ export default function DiscoveryMap3D(): JSX.Element {
           }}
         >
           {loading ? "loading points..." : `error: ${error}`}
+        </div>
+      )}
+
+      {!loading && !error && (
+        <div
+          style={{
+            position: "absolute",
+            top: 52,
+            right: 24,
+            color: "#95a6c8",
+            fontSize: 11,
+            opacity: 0.9,
+          }}
+        >
+          {`nodes: ${transformed.pointCount} • edges: ${sceneEdges.length} (min_conf=${edgeMinConfUsed})`}
         </div>
       )}
     </div>

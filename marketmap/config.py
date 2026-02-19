@@ -35,6 +35,30 @@ class Settings(BaseSettings):
     # Discovery graph
     discovery_top_k_neighbors: int = 15
     discovery_min_similarity: float = 0.3
+    discovery_projection_gating_enabled: bool = True
+    discovery_projection_version_mode: str = "latest"
+    discovery_projection_version_explicit: str = ""
+    discovery_max_3d_distance_quantile: float = 0.95
+    discovery_alpha_semantic: float = 1.0
+    discovery_beta_3d_penalty: float = 0.18
+    discovery_candidate_k: int = 20
+    discovery_keep_k: int = 5
+    discovery_mutual_knn_enabled: bool = True
+    discovery_cluster_gating_enabled: bool = True
+    discovery_bridge_edges_per_cluster_pair: int = 2
+    discovery_bridge_min_similarity: float = 0.72
+    discovery_force_disable_cross_neighborhood: bool = True
+
+    # Legacy tuning knobs kept for backward compatibility
+    discovery_similarity_margin: float = 0.0
+    discovery_max_3d_distance_percentile: float = 0.9
+    discovery_hybrid_alpha: float = 0.82
+    discovery_hybrid_beta: float = 0.18
+    discovery_hub_penalty_weight: float = 0.04
+    discovery_generic_title_penalty: float = 0.02
+    discovery_template_penalty: float = 0.04
+    discovery_min_hybrid_score: float = 0.03
+    discovery_cross_local_cluster_distance_relax: float = 0.72
     discovery_cross_neighborhood_edges_enabled: bool = False
     discovery_cross_neighborhood_top_k: int = 2
     discovery_cross_neighborhood_min_similarity: float = 0.72
