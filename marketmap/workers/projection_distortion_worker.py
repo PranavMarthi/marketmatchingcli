@@ -105,7 +105,8 @@ def compute_projection_distortion_scores(self, neighbor_k: int | None = None) ->
         result = session.execute(
             text(
                 """
-                SELECT p.market_id, me.embedding::text, p.x, p.y, p.z
+                SELECT p.market_id, me.embedding::text, p.x, p.y, p.z,
+                       m.local_distortion, m.stitch_distortion
                 FROM market_projection_3d p
                 JOIN market_embeddings me ON me.market_id = p.market_id
                 JOIN markets m ON m.id = p.market_id
@@ -128,8 +129,9 @@ def compute_projection_distortion_scores(self, neighbor_k: int | None = None) ->
         market_ids: list[str] = []
         embedding_rows: list[np.ndarray] = []
         projected_rows: list[tuple[float, float, float]] = []
+        local_first_scores: list[float | None] = []
 
-        for market_id, embedding, x, y, z in rows:
+        for market_id, embedding, x, y, z, local_distortion, stitch_distortion in rows:
             vec = _parse_embedding(embedding)
             if vec.shape[0] != settings.embedding_dim:
                 continue
@@ -138,6 +140,12 @@ def compute_projection_distortion_scores(self, neighbor_k: int | None = None) ->
             market_ids.append(market_id)
             embedding_rows.append(vec)
             projected_rows.append((float(x), float(y), float(z)))
+            if local_distortion is not None or stitch_distortion is not None:
+                ld = float(local_distortion) if local_distortion is not None else 0.0
+                sd = float(stitch_distortion) if stitch_distortion is not None else 0.0
+                local_first_scores.append(max(0.0, min(1.0, 0.75 * ld + 0.25 * min(1.0, sd / 20.0))))
+            else:
+                local_first_scores.append(None)
 
         n = len(market_ids)
         if n < 3:
@@ -198,13 +206,16 @@ def compute_projection_distortion_scores(self, neighbor_k: int | None = None) ->
             proj_neighbor_ids = proj_neighbors[i][1:]
             proj_neighbor_distances = proj_distances[i][1:]
 
-            overlap_score = _distance_weighted_overlap(
-                embedding_neighbor_ids=emb_neighbor_ids,
-                embedding_neighbor_distances=emb_neighbor_distances,
-                projected_neighbor_ids=proj_neighbor_ids,
-                projected_neighbor_distances=proj_neighbor_distances,
-            )
-            distortion_score = float(max(0.0, min(1.0, 1.0 - overlap_score)))
+            if local_first_scores[i] is not None:
+                distortion_score = float(local_first_scores[i])
+            else:
+                overlap_score = _distance_weighted_overlap(
+                    embedding_neighbor_ids=emb_neighbor_ids,
+                    embedding_neighbor_distances=emb_neighbor_distances,
+                    projected_neighbor_ids=proj_neighbor_ids,
+                    projected_neighbor_distances=proj_neighbor_distances,
+                )
+                distortion_score = float(max(0.0, min(1.0, 1.0 - overlap_score)))
             distortion_scores.append(distortion_score)
 
             session.execute(

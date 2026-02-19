@@ -1,5 +1,5 @@
-import DiscoveryMap3D from "../DiscoveryMap3D";
+import PolySpace from "./components/PolySpace/PolySpace";
 
 export default function App(): JSX.Element {
-  return <DiscoveryMap3D />;
+  return <PolySpace />;
 }

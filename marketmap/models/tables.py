@@ -38,12 +38,26 @@ class Market(Base):
     outcome_prices = Column(String, nullable=True)  # JSON string "[0.63, 0.37]"
     clob_token_ids = Column(String, nullable=True)  # JSON string of CLOB token IDs
     event_id = Column(String, nullable=True, index=True)
+    polymarket_event_id = Column(String, nullable=True, index=True)
     is_active = Column(Float, nullable=True)  # 1.0=active, 0.0=closed
     is_template = Column(Float, nullable=True)
     neg_risk = Column(Float, nullable=True)  # negRisk flag from Polymarket
     link = Column(Text, nullable=True)  # Polymarket URL
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    neighborhood_key = Column(String, nullable=True, index=True)
+    neighborhood_label = Column(String, nullable=True)
+    neighborhood_rank = Column(Integer, nullable=True)
+    local_cluster_id = Column(Integer, nullable=True, index=True)
+    local_x = Column(Float, nullable=True)
+    local_y = Column(Float, nullable=True)
+    local_z = Column(Float, nullable=True)
+    global_x = Column(Float, nullable=True)
+    global_y = Column(Float, nullable=True)
+    global_z = Column(Float, nullable=True)
+    local_distortion = Column(Float, nullable=True)
+    stitch_distortion = Column(Float, nullable=True)
 
     __table_args__ = (
         Index("idx_markets_category", "category"),
@@ -71,9 +85,26 @@ class MarketEmbedding(Base):
     __tablename__ = "market_embeddings"
 
     market_id = Column(String, primary_key=True)
-    embedding = Column(Vector(384), nullable=False)
-    model_name = Column(String, nullable=True, default="all-MiniLM-L6-v2")
+    embedding = Column(Vector(1024), nullable=False)
+    model_name = Column(String, nullable=True, default="BAAI/bge-large-en-v1.5")
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class MarketProjectionManifold(Base):
+    """Cached stage-1 manifold vectors used by two-stage UMAP."""
+
+    __tablename__ = "market_projection_manifold"
+
+    market_id = Column(String, primary_key=True)
+    manifold_version = Column(String, nullable=False, index=True)
+    embedding_version = Column(String, nullable=False, index=True)
+    manifold = Column(Vector(15), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_projection_manifold_version_market", "manifold_version", "market_id"),
+        Index("idx_projection_manifold_embedding", "embedding_version"),
+    )
 
 
 class MarketEntity(Base):
@@ -133,8 +164,51 @@ class PolymarketEvent(Base):
     volume = Column(Float, nullable=True)
     neg_risk = Column(Float, nullable=True)
     is_active = Column(Float, nullable=True)
+    raw = Column(JSONB, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class PolymarketTag(Base):
+    """Normalized event tag dimension."""
+
+    __tablename__ = "polymarket_tags"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tag = Column(String, nullable=False, unique=True, index=True)
+
+
+class PolymarketEventTag(Base):
+    """Many-to-many join between polymarket_events and polymarket_tags."""
+
+    __tablename__ = "polymarket_event_tags"
+
+    event_id = Column(String, primary_key=True)
+    tag_id = Column(Integer, primary_key=True)
+
+    __table_args__ = (
+        Index("idx_event_tags_event_id", "event_id"),
+        Index("idx_event_tags_tag_id", "tag_id"),
+    )
+
+
+class Neighborhood(Base):
+    """Neighborhood anchors + metadata for hierarchical projection."""
+
+    __tablename__ = "neighborhoods"
+
+    neighborhood_key = Column(String, primary_key=True)
+    label = Column(String, nullable=False)
+    market_count = Column(Integer, nullable=False, default=0)
+    anchor_x = Column(Float, nullable=True)
+    anchor_y = Column(Float, nullable=True)
+    anchor_z = Column(Float, nullable=True)
+    scale = Column(Float, nullable=False, default=1.0)
+    centroid_vector = Column(Vector(1024), nullable=True)
+    meta = Column(JSONB, nullable=False, default=dict)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (Index("idx_neighborhoods_market_count", market_count.desc()),)
 
 
 class MarketProjection3D(Base):

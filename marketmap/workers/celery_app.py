@@ -20,6 +20,10 @@ app = Celery(
         "marketmap.workers.projection_distortion_worker",
         "marketmap.workers.memgraph_sync_worker",
         "marketmap.workers.clustering_worker",
+        "marketmap.workers.neighborhood_worker",
+        "marketmap.workers.local_clustering_worker",
+        "marketmap.workers.pipeline_orchestrator",
+        "marketmap.workers.event_projection_worker",
     ],
 )
 
@@ -66,6 +70,16 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=3, minute=0),  # 3:00 AM UTC daily (after embeddings)
         "options": {"queue": "default"},
     },
+    "ingest-event-tags-daily": {
+        "task": "marketmap.workers.neighborhood_worker.ingest_event_tags",
+        "schedule": crontab(hour=3, minute=10),
+        "options": {"queue": "default"},
+    },
+    "assign-neighborhoods-daily": {
+        "task": "marketmap.workers.neighborhood_worker.assign_neighborhoods",
+        "schedule": crontab(hour=3, minute=20),
+        "options": {"queue": "default"},
+    },
     # Milestone 3: Hedge graph workers (daily, after fresh price snapshots)
     "compute-hedge-edges-daily": {
         "task": "marketmap.workers.hedge_worker.compute_hedge_edges",
@@ -77,14 +91,24 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=4, minute=0),
         "options": {"queue": "default"},
     },
+    "compute-local-clusters-daily": {
+        "task": "marketmap.workers.local_clustering_worker.compute_local_clusters",
+        "schedule": crontab(hour=4, minute=15),
+        "options": {"queue": "default"},
+    },
     "compute-discovery-clusters-daily": {
         "task": "marketmap.workers.clustering_worker.compute_discovery_clusters",
-        "schedule": crontab(hour=4, minute=15),
+        "schedule": crontab(hour=4, minute=17),
         "options": {"queue": "default"},
     },
     "compute-projection-distortion-daily": {
         "task": "marketmap.workers.projection_distortion_worker.compute_projection_distortion_scores",
         "schedule": crontab(hour=4, minute=20),
+        "options": {"queue": "default"},
+    },
+    "compute-event-projection-daily": {
+        "task": "marketmap.workers.event_projection_worker.run_event_projection_pipeline",
+        "schedule": crontab(hour=4, minute=40),
         "options": {"queue": "default"},
     },
     "sync-memgraph-discovery-daily": {

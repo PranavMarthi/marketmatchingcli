@@ -28,6 +28,17 @@ class MarketNode(BaseModel):
     projection_version: str | None = None
     cluster_id: str | None = None
     distortion_score: float | None = None
+    neighborhood_key: str | None = None
+    neighborhood_label: str | None = None
+    local_cluster_id: int | None = None
+    local_x: float | None = None
+    local_y: float | None = None
+    local_z: float | None = None
+    global_x: float | None = None
+    global_y: float | None = None
+    global_z: float | None = None
+    local_distortion: float | None = None
+    stitch_distortion: float | None = None
 
 
 class GraphLink(BaseModel):
@@ -78,6 +89,28 @@ class MarketDetail(BaseModel):
     projection_version: str | None = None
     cluster_id: str | None = None
     distortion_score: float | None = None
+    neighborhood_key: str | None = None
+    neighborhood_label: str | None = None
+    local_cluster_id: int | None = None
+    local_x: float | None = None
+    local_y: float | None = None
+    local_z: float | None = None
+    global_x: float | None = None
+    global_y: float | None = None
+    global_z: float | None = None
+    local_distortion: float | None = None
+    stitch_distortion: float | None = None
+
+
+class NeighborhoodNode(BaseModel):
+    neighborhood_key: str
+    label: str
+    market_count: int
+    anchor_x: float | None = None
+    anchor_y: float | None = None
+    anchor_z: float | None = None
+    scale: float
+    meta: dict[str, Any] = Field(default_factory=dict)
 
 
 class PricePoint(BaseModel):

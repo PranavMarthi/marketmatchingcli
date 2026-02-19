@@ -16,3 +16,5 @@ venv/
 celerybeat-schedule*
 node_modules/
 frontend/dist/
+.DS_Store
+all_active_polymarket_events.json

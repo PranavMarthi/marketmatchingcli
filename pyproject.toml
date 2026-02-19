@@ -37,6 +37,7 @@ dev = [
 
 [project.scripts]
 marketmap-score = "marketmap.cli:main"
+marketmap-ingest-event-tags = "marketmap.ingest.polymarket_event_tags:main"
 
 [build-system]
 requires = ["hatchling"]

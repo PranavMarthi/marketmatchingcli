@@ -248,6 +248,7 @@ def parse_market_for_db(raw: dict[str, Any]) -> dict[str, Any]:
         "outcome_prices": json.dumps(outcome_prices) if outcome_prices else None,
         "clob_token_ids": json.dumps(clob_token_ids_parsed) if clob_token_ids_parsed else None,
         "event_id": raw.get("_event_id") or None,
+        "polymarket_event_id": raw.get("_event_id") or None,
         "is_active": 1.0 if raw.get("active") else 0.0,
         "is_template": 1.0 if raw.get("_event_neg_risk") else 0.0,
         "neg_risk": 1.0 if raw.get("_event_neg_risk") else 0.0,

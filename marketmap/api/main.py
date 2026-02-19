@@ -18,6 +18,7 @@ from marketmap.api.schemas import (
     MarketDetail,
     MarketNode,
     MarketPriceHistory,
+    NeighborhoodNode,
     PricePoint,
 )
 from marketmap.config import settings
@@ -49,7 +50,10 @@ app.add_middleware(
 MARKET_COLS = (
     "m.id, m.title, m.link, m.outcome_prices, m.volume, m.liquidity, "
     "m.category, m.close_time, m.event_id, m.description, m.is_active, "
-    "p.x, p.y, p.z, p.projection_version"
+    "COALESCE(m.global_x, p.x), COALESCE(m.global_y, p.y), COALESCE(m.global_z, p.z), p.projection_version, "
+    "m.neighborhood_key, m.neighborhood_label, m.local_cluster_id, "
+    "m.local_x, m.local_y, m.local_z, m.global_x, m.global_y, m.global_z, "
+    "m.local_distortion, m.stitch_distortion"
 )
 MARKET_JOIN = "LEFT JOIN market_projection_3d p ON p.market_id = m.id"
 
@@ -89,6 +93,17 @@ def _row_to_node(row) -> MarketNode:  # type: ignore[no-untyped-def]
         projection_version=row[14],
         cluster_id=None,
         distortion_score=None,
+        neighborhood_key=row[15],
+        neighborhood_label=row[16],
+        local_cluster_id=row[17],
+        local_x=row[18],
+        local_y=row[19],
+        local_z=row[20],
+        global_x=row[21],
+        global_y=row[22],
+        global_z=row[23],
+        local_distortion=row[24],
+        stitch_distortion=row[25],
     )
 
 
@@ -111,6 +126,17 @@ def _row_to_detail(row) -> MarketDetail:  # type: ignore[no-untyped-def]
         projection_version=row[14],
         cluster_id=None,
         distortion_score=None,
+        neighborhood_key=row[15],
+        neighborhood_label=row[16],
+        local_cluster_id=row[17],
+        local_x=row[18],
+        local_y=row[19],
+        local_z=row[20],
+        global_x=row[21],
+        global_y=row[22],
+        global_z=row[23],
+        local_distortion=row[24],
+        stitch_distortion=row[25],
     )
 
 
@@ -129,6 +155,149 @@ def _edge_row_to_link(row) -> GraphLink:  # type: ignore[no-untyped-def]
         template_penalty=row[9],
         explanation=row[10],
     )
+
+
+EVENT_EDGE_NON_SEMANTIC_FLOOR = 0.20
+EVENT_EDGE_MAX_PER_NODE = 4
+
+
+async def _fetch_event_links(
+    session: AsyncSession,
+    event_ids: list[str],
+    min_conf: float,
+    max_edges_per_event: int = EVENT_EDGE_MAX_PER_NODE,
+) -> list[GraphLink]:
+    if len(event_ids) < 2:
+        return []
+
+    result = await session.execute(
+        text(
+            """
+            WITH event_nodes AS (
+                SELECT event_id,
+                       COALESCE(NULLIF(neighborhood_key, ''), 'misc') AS neighborhood_key,
+                       COALESCE(local_cluster_id, -1) AS local_cluster_id
+                FROM event_projection_3d
+                WHERE event_id = ANY(:event_ids)
+            ),
+            pair_scores AS (
+                SELECT
+                    LEAST(m1.polymarket_event_id, m2.polymarket_event_id) AS source_event_id,
+                    GREATEST(m1.polymarket_event_id, m2.polymarket_event_id) AS target_event_id,
+                    AVG(COALESCE(me.stat_score, 0.0)) AS stat_score,
+                    AVG(COALESCE(me.logical_score, 0.0)) AS logical_score,
+                    AVG(COALESCE(me.propagation_score, 0.0)) AS propagation_score,
+                    AVG(COALESCE(me.entity_overlap_score, 0.0)) AS entity_overlap_score,
+                    AVG(COALESCE(me.semantic_score, 0.0)) AS semantic_score,
+                    COUNT(*)::int AS support_count
+                FROM market_edges me
+                JOIN markets m1 ON m1.id = me.source_id
+                JOIN markets m2 ON m2.id = me.target_id
+                JOIN event_nodes e1 ON e1.event_id = m1.polymarket_event_id
+                JOIN event_nodes e2 ON e2.event_id = m2.polymarket_event_id
+                WHERE me.edge_type = 'hedge'
+                  AND m1.polymarket_event_id IS NOT NULL
+                  AND m2.polymarket_event_id IS NOT NULL
+                  AND m1.polymarket_event_id <> m2.polymarket_event_id
+                  AND e1.neighborhood_key = e2.neighborhood_key
+                  AND e1.local_cluster_id = e2.local_cluster_id
+                GROUP BY
+                    LEAST(m1.polymarket_event_id, m2.polymarket_event_id),
+                    GREATEST(m1.polymarket_event_id, m2.polymarket_event_id)
+            )
+            SELECT source_event_id,
+                   target_event_id,
+                   stat_score,
+                   logical_score,
+                   propagation_score,
+                   entity_overlap_score,
+                   semantic_score,
+                   support_count,
+                   (
+                     0.35 * stat_score
+                     + 0.30 * logical_score
+                     + 0.20 * propagation_score
+                     + 0.10 * entity_overlap_score
+                     + 0.05 * semantic_score
+                   ) AS confidence,
+                   (
+                     0.35 * stat_score
+                     + 0.30 * logical_score
+                     + 0.20 * propagation_score
+                     + 0.10 * entity_overlap_score
+                   ) AS non_semantic_strength
+            FROM pair_scores
+            ORDER BY confidence DESC
+            """
+        ),
+        {"event_ids": event_ids},
+    )
+
+    candidates = []
+    for row in result.fetchall():
+        confidence = float(row[8])
+        non_semantic_strength = float(row[9])
+        if confidence < min_conf:
+            continue
+        if non_semantic_strength < EVENT_EDGE_NON_SEMANTIC_FLOOR:
+            continue
+        candidates.append(row)
+
+    candidates.sort(key=lambda r: float(r[8]), reverse=True)
+    per_node_counts: dict[str, int] = {}
+    links: list[GraphLink] = []
+
+    for row in candidates:
+        src = str(row[0])
+        tgt = str(row[1])
+        src_count = per_node_counts.get(src, 0)
+        tgt_count = per_node_counts.get(tgt, 0)
+        if src_count >= max_edges_per_event or tgt_count >= max_edges_per_event:
+            continue
+
+        confidence = float(row[8])
+        explanation = {
+            "type": "event_cluster_relation",
+            "formula": {
+                "statistical_strength": 0.35,
+                "logical_consistency": 0.30,
+                "propagation_signal": 0.20,
+                "entity_overlap": 0.10,
+                "semantic_similarity": 0.05,
+            },
+            "non_semantic_floor": EVENT_EDGE_NON_SEMANTIC_FLOOR,
+            "components": {
+                "statistical_strength": round(float(row[2]), 4),
+                "logical_consistency": round(float(row[3]), 4),
+                "propagation_signal": round(float(row[4]), 4),
+                "entity_overlap": round(float(row[5]), 4),
+                "semantic_similarity": round(float(row[6]), 4),
+                "support_count": int(row[7]),
+                "non_semantic_strength": round(float(row[9]), 4),
+            },
+        }
+
+        links.append(
+            GraphLink(
+                source=src,
+                target=tgt,
+                confidence=confidence,
+                type="event_cluster",
+                weight=confidence,
+                semantic_score=float(row[6]),
+                stat_score=float(row[2]),
+                logical_score=float(row[3]),
+                propagation_score=float(row[4]),
+                entity_overlap_score=float(row[5]),
+                template_penalty=0.0,
+                explanation=explanation,
+            )
+        )
+
+        per_node_counts[src] = src_count + 1
+        per_node_counts[tgt] = tgt_count + 1
+
+    return links
 
 
 async def _latest_projection_version(session: AsyncSession) -> str | None:
@@ -390,6 +559,72 @@ async def _build_discovery_viewport(
     }
 
 
+async def _fetch_event_nodes(
+    session: AsyncSession,
+    neighborhood_key: str | None,
+    min_distortion: float | None,
+    include_local: bool,
+) -> list[MarketNode]:
+    where = ["1=1"]
+    params: dict[str, Any] = {}
+    if neighborhood_key:
+        where.append("ep.neighborhood_key = :neighborhood_key")
+        params["neighborhood_key"] = neighborhood_key
+    if min_distortion is not None:
+        where.append("COALESCE(ep.local_distortion, 0.0) >= :min_distortion")
+        params["min_distortion"] = min_distortion
+
+    result = await session.execute(
+        text(
+            f"""
+            SELECT ep.event_id,
+                   COALESCE(e.title, ep.event_id) AS label,
+                   NULL::text AS link,
+                   NULL::text AS outcome_prices,
+                   NULL::double precision AS volume,
+                   NULL::double precision AS liquidity,
+                   ep.neighborhood_label AS category,
+                   NULL::timestamptz AS close_time,
+                   ep.event_id AS event_id,
+                   COALESCE(e.raw->>'description', '') AS description,
+                   1.0 AS is_active,
+                   ep.x, ep.y, ep.z,
+                   ep.projection_version,
+                   ep.neighborhood_key,
+                   ep.neighborhood_label,
+                   ep.local_cluster_id,
+                   NULL::double precision AS local_x,
+                   NULL::double precision AS local_y,
+                   NULL::double precision AS local_z,
+                   ep.x AS global_x,
+                   ep.y AS global_y,
+                   ep.z AS global_z,
+                   ep.local_distortion,
+                   ep.stitch_distortion
+            FROM event_projection_3d ep
+            JOIN polymarket_events e ON e.id = ep.event_id
+            WHERE {' AND '.join(where)}
+            ORDER BY ep.event_id ASC
+            """
+        ),
+        params,
+    )
+    nodes = [_row_to_node(row) for row in result.fetchall()]
+    if not include_local:
+        for node in nodes:
+            node.local_cluster_id = None
+            node.local_x = None
+            node.local_y = None
+            node.local_z = None
+            node.local_distortion = None
+            node.stitch_distortion = None
+    for node in nodes:
+        if node.local_cluster_id is not None:
+            node.cluster_id = f"{node.neighborhood_key}:{node.local_cluster_id}"
+        node.distortion_score = node.local_distortion
+    return nodes
+
+
 # --- Health ---
 
 
@@ -483,10 +718,50 @@ async def get_discovery_graph(
 async def get_discovery_graph_all(
     min_conf: float = Query(0.3, ge=0.0, le=1.0, description="Minimum confidence for edges"),
     include_edges: bool = Query(True, description="Include discovery edges"),
+    neighborhood_key: str | None = Query(None, description="Filter by neighborhood key"),
+    min_distortion: float | None = Query(None, ge=0.0, le=1.0),
+    include_local: bool = Query(True, description="Include local coordinate fields"),
+    entity: str = Query("events", pattern="^(events|markets)$"),
     session: AsyncSession = Depends(get_async_session),
 ) -> GraphResponse:
     """Return the full discovery graph (all active markets + discovery edges)."""
-    if settings.memgraph_enabled and memgraph_is_available():
+    if entity == "events":
+        nodes = await _fetch_event_nodes(
+            session=session,
+            neighborhood_key=neighborhood_key,
+            min_distortion=min_distortion,
+            include_local=include_local,
+        )
+        event_ids = [n.id for n in nodes]
+        links = (
+            await _fetch_event_links(
+                session=session,
+                event_ids=event_ids,
+                min_conf=min_conf,
+            )
+            if include_edges and event_ids
+            else []
+        )
+        projection_version = next((n.projection_version for n in nodes if n.projection_version), None)
+        return GraphResponse(
+            nodes=nodes,
+            links=links,
+            meta={
+                "scope": "all",
+                "entity": "events",
+                "min_conf": min_conf,
+                "include_edges": include_edges,
+                "neighborhood_key": neighborhood_key,
+                "min_distortion": min_distortion,
+                "include_local": include_local,
+                "node_count": len(nodes),
+                "edge_count": len(links),
+                "projection_version": projection_version,
+                "source": "postgres",
+            },
+        )
+
+    if settings.memgraph_enabled and memgraph_is_available() and neighborhood_key is None and min_distortion is None:
         payload = fetch_discovery_graph(min_conf=min_conf, include_edges=include_edges)
         nodes_payload = payload.get("nodes", [])
         projection_version = payload.get("meta", {}).get("projection_version")
@@ -569,16 +844,34 @@ async def get_discovery_graph_all(
                                 node["distortion_score"] = distortion_map.get(market_id)
         return GraphResponse(**payload)
 
+    where_sql = "m.is_active = 1.0"
+    params: dict[str, Any] = {"min_conf": min_conf}
+    if neighborhood_key:
+        where_sql += " AND m.neighborhood_key = :neighborhood_key"
+        params["neighborhood_key"] = neighborhood_key
+    if min_distortion is not None:
+        where_sql += " AND COALESCE(m.local_distortion, 0.0) >= :min_distortion"
+        params["min_distortion"] = min_distortion
+
     result = await session.execute(
         text(
             f"SELECT {MARKET_COLS} FROM markets m {MARKET_JOIN} "
-            "WHERE m.is_active = 1.0 ORDER BY m.volume DESC NULLS LAST"
-        )
+            f"WHERE {where_sql} ORDER BY m.volume DESC NULLS LAST"
+        ),
+        params,
     )
 
     nodes = [_row_to_node(row) for row in result.fetchall()]
     await _attach_cluster_ids(session, nodes)
     await _attach_distortion_scores(session, nodes)
+    if not include_local:
+        for node in nodes:
+            node.local_x = None
+            node.local_y = None
+            node.local_z = None
+            node.local_cluster_id = None
+            node.local_distortion = None
+            node.stitch_distortion = None
     node_ids = [n.id for n in nodes]
 
     links: list[GraphLink] = []
@@ -608,14 +901,44 @@ async def get_discovery_graph_all(
         links=links,
         meta={
             "scope": "all",
+            "entity": "markets",
             "min_conf": min_conf,
             "include_edges": include_edges,
+            "neighborhood_key": neighborhood_key,
+            "min_distortion": min_distortion,
+            "include_local": include_local,
             "node_count": len(nodes),
             "edge_count": len(links),
             "projection_version": projection_version,
             "source": "postgres",
         },
     )
+
+
+@app.get("/graph/neighborhoods", response_model=list[NeighborhoodNode])
+async def get_neighborhoods(session: AsyncSession = Depends(get_async_session)) -> list[NeighborhoodNode]:
+    result = await session.execute(
+        text(
+            """
+            SELECT neighborhood_key, label, market_count, anchor_x, anchor_y, anchor_z, scale, meta
+            FROM neighborhoods
+            ORDER BY market_count DESC, neighborhood_key ASC
+            """
+        )
+    )
+    return [
+        NeighborhoodNode(
+            neighborhood_key=row[0],
+            label=row[1],
+            market_count=int(row[2]),
+            anchor_x=row[3],
+            anchor_y=row[4],
+            anchor_z=row[5],
+            scale=float(row[6]),
+            meta=row[7] or {},
+        )
+        for row in result.fetchall()
+    ]
 
 
 @app.get("/graph/discovery/viewport", response_model=GraphResponse)

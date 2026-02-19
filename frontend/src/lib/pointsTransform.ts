@@ -4,6 +4,11 @@ export type RawPoint = {
   y?: number;
   z?: number;
   cluster_id?: string | null;
+  neighborhood_key?: string | null;
+  neighborhood_label?: string | null;
+  local_cluster_id?: number | null;
+  local_distortion?: number | null;
+  stitch_distortion?: number | null;
 };
 
 export type Bounds3D = {
@@ -17,10 +22,25 @@ export type PointTransformResult = {
   positions: Float32Array;
   colors: Float32Array;
   pointCount: number;
-  validPoints: Array<Required<Pick<RawPoint, "id" | "x" | "y" | "z">> & { cluster_id?: string | null }>;
+  validPoints: Array<
+    Required<Pick<RawPoint, "id" | "x" | "y" | "z">> & {
+      cluster_id?: string | null;
+      neighborhood_key?: string | null;
+      neighborhood_label?: string | null;
+      local_cluster_id?: number | null;
+      local_distortion?: number | null;
+      stitch_distortion?: number | null;
+    }
+  >;
   bounds: Bounds3D;
   scale: number;
   suggestedCameraDistance: number;
+};
+
+export type PointTransformOptions = {
+  colorBy?: "neighborhood" | "local_cluster";
+  intraClusterScale?: number;
+  macroSeparation?: number;
 };
 
 const TARGET_SCENE_SPAN = 80;
@@ -31,8 +51,22 @@ const MIN_CLUSTER_POINTS_FOR_COLOR = 20;
 // Adjust MAX_CLUSTER_NEIGHBOR_DISTANCE to make clusters looser/tighter.
 const APPROX_K_NEIGHBORS = 12;
 const MAX_CLUSTER_NEIGHBOR_DISTANCE = 1.8;
+const CLUSTER_ID_COVERAGE_THRESHOLD = 0.6;
 
 const FALLBACK_UNCLUSTERED: readonly [number, number, number] = [0.82, 0.86, 0.94];
+
+const MACRO_HUE: Record<string, number> = {
+  sports: 145, // green-cyan
+  politics: 355, // red
+  crypto: 220, // blue
+  geopolitics: 32, // orange
+  economy: 52, // amber
+  misc: 270, // violet
+  tech: 198, // cyan-blue
+  pop_culture: 314, // magenta
+  science: 176, // teal
+  weather: 86, // lime
+};
 
 function finiteNumber(value: number | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value);
@@ -118,7 +152,7 @@ function hslToRgb(h: number, s: number, l: number): readonly [number, number, nu
 function colorForTopCluster(clusterId: string): readonly [number, number, number] {
   const hash = hashString(clusterId);
   const hue = (hash % 360) / 360;
-  const sat = 0.88;
+  const sat = 0.82;
   const light = 0.56;
   return hslToRgb(hue, sat, light);
 }
@@ -126,9 +160,38 @@ function colorForTopCluster(clusterId: string): readonly [number, number, number
 function colorForSmallCluster(clusterId: string): readonly [number, number, number] {
   const hash = hashString(clusterId);
   const hue = (hash % 360) / 360;
-  const sat = 0.42;
+  const sat = 0.52;
   const light = 0.62;
   return hslToRgb(hue, sat, light);
+}
+
+function extractMacroKey(clusterLabel: string): string {
+  const parts = clusterLabel.split("::");
+  return parts[0] || "misc";
+}
+
+function baseHueForMacro(macroKey: string): number {
+  const normalized = macroKey.trim().toLowerCase();
+  if (normalized in MACRO_HUE) return MACRO_HUE[normalized];
+  return hashString(normalized) % 360;
+}
+
+function colorForNeighborhood(clusterLabel: string): readonly [number, number, number] {
+  const hue = baseHueForMacro(extractMacroKey(clusterLabel)) / 360;
+  return hslToRgb(hue, 0.82, 0.56);
+}
+
+function colorForLocalClusterLabel(clusterLabel: string): readonly [number, number, number] {
+  const macro = extractMacroKey(clusterLabel);
+  const baseHue = baseHueForMacro(macro);
+  const match = /::c(\d+)$/.exec(clusterLabel);
+  const clusterIndex = match ? Number.parseInt(match[1], 10) : 0;
+
+  const hueOffset = ((clusterIndex * 37) % 72) - 36; // stay in macro family but distinguish
+  const hue = ((baseHue + hueOffset + 360) % 360) / 360;
+  const sat = 0.68 + ((clusterIndex * 17) % 7) * 0.03;
+  const light = 0.46 + ((clusterIndex * 13) % 7) * 0.04;
+  return hslToRgb(hue, Math.min(0.92, sat), Math.min(0.72, light));
 }
 
 function buildClusterCounts(labels: string[]): Map<string, number> {
@@ -147,11 +210,283 @@ function buildTopClusterSet(clusterCounts: Map<string, number>): Set<string> {
   return new Set(ranked);
 }
 
+function shouldUseBackendClusterIds(points: Array<{ cluster_id?: string | null }>): boolean {
+  if (points.length === 0) return false;
+  let assigned = 0;
+  for (const point of points) {
+    if (point.cluster_id && point.cluster_id.length > 0) {
+      assigned += 1;
+    }
+  }
+  return assigned / points.length >= CLUSTER_ID_COVERAGE_THRESHOLD;
+}
+
+function buildClusterLabelsFromBackend(points: Array<{ cluster_id?: string | null }>): string[] {
+  return points.map((point) => (point.cluster_id && point.cluster_id.length > 0 ? point.cluster_id : "-1"));
+}
+
 type ScaledPoint = {
   x: number;
   y: number;
   z: number;
 };
+
+function expandIntraClusterSpacing<T extends { x: number; y: number; z: number; neighborhood_key?: string | null }>(
+  points: T[],
+  factor: number
+): T[] {
+  const safeFactor = Number.isFinite(factor) ? Math.min(2.2, Math.max(1.0, factor)) : 1.0;
+  if (safeFactor <= 1.0001) return points;
+
+  const groups = new Map<string, number[]>();
+  for (let i = 0; i < points.length; i += 1) {
+    const key = points[i].neighborhood_key ?? "misc";
+    const arr = groups.get(key);
+    if (arr) arr.push(i);
+    else groups.set(key, [i]);
+  }
+
+  const out = points.map((p) => ({ ...p }));
+  for (const idxs of groups.values()) {
+    if (idxs.length < 3) continue;
+    let cx = 0;
+    let cy = 0;
+    let cz = 0;
+    for (const idx of idxs) {
+      cx += points[idx].x;
+      cy += points[idx].y;
+      cz += points[idx].z;
+    }
+    cx /= idxs.length;
+    cy /= idxs.length;
+    cz /= idxs.length;
+
+    for (const idx of idxs) {
+      const dx = points[idx].x - cx;
+      const dy = points[idx].y - cy;
+      const dz = points[idx].z - cz;
+      out[idx].x = cx + dx * safeFactor;
+      out[idx].y = cy + dy * safeFactor;
+      out[idx].z = cz + dz * safeFactor;
+    }
+  }
+  return out;
+}
+
+function expandInterClusterSpacing<T extends { x: number; y: number; z: number; neighborhood_key?: string | null }>(
+  points: T[],
+  factor: number
+): T[] {
+  const safeFactor = Number.isFinite(factor) ? Math.min(4.0, Math.max(0.55, factor)) : 1.0;
+  if (Math.abs(safeFactor - 1.0) < 0.0001) return points;
+
+  const groups = new Map<string, number[]>();
+  for (let i = 0; i < points.length; i += 1) {
+    const key = points[i].neighborhood_key ?? "misc";
+    const arr = groups.get(key);
+    if (arr) arr.push(i);
+    else groups.set(key, [i]);
+  }
+
+  const out = points.map((p) => ({ ...p }));
+
+  let gx = 0;
+  let gy = 0;
+  let gz = 0;
+  for (const p of points) {
+    gx += p.x;
+    gy += p.y;
+    gz += p.z;
+  }
+  gx /= points.length;
+  gy /= points.length;
+  gz /= points.length;
+
+  for (const idxs of groups.values()) {
+    if (idxs.length === 0) continue;
+    let cx = 0;
+    let cy = 0;
+    let cz = 0;
+    for (const idx of idxs) {
+      cx += points[idx].x;
+      cy += points[idx].y;
+      cz += points[idx].z;
+    }
+    cx /= idxs.length;
+    cy /= idxs.length;
+    cz /= idxs.length;
+
+    const separationBoost = (safeFactor - 1) * 1.35;
+    const shiftX = (cx - gx) * separationBoost;
+    const shiftY = (cy - gy) * separationBoost;
+    const shiftZ = (cz - gz) * separationBoost;
+
+    for (const idx of idxs) {
+      out[idx].x = points[idx].x + shiftX;
+      out[idx].y = points[idx].y + shiftY;
+      out[idx].z = points[idx].z + shiftZ;
+    }
+  }
+
+  // Enforce a balanced macro-radius band so no single neighborhood drifts too far
+  // while still keeping visible separation between all neighborhoods.
+  const groupCentroids = new Map<string, { x: number; y: number; z: number; idxs: number[] }>();
+  for (const [key, idxs] of groups.entries()) {
+    if (idxs.length === 0) continue;
+    let cx = 0;
+    let cy = 0;
+    let cz = 0;
+    for (const idx of idxs) {
+      cx += out[idx].x;
+      cy += out[idx].y;
+      cz += out[idx].z;
+    }
+    groupCentroids.set(key, {
+      x: cx / idxs.length,
+      y: cy / idxs.length,
+      z: cz / idxs.length,
+      idxs,
+    });
+  }
+
+  const centroidRadii: number[] = [];
+  for (const c of groupCentroids.values()) {
+    const dx = c.x - gx;
+    const dy = c.y - gy;
+    const dz = c.z - gz;
+    centroidRadii.push(Math.sqrt(dx * dx + dy * dy + dz * dz));
+  }
+
+  if (centroidRadii.length >= 3) {
+    const sorted = [...centroidRadii].sort((a, b) => a - b);
+    const q = (p: number): number => {
+      const idx = Math.max(0, Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p)));
+      return sorted[idx];
+    };
+
+    const median = q(0.5);
+    const minAllowed = Math.max(median * 0.82, q(0.3));
+    const maxAllowed = Math.max(minAllowed + 1e-6, Math.min(median * 1.16, q(0.78)));
+
+    for (const c of groupCentroids.values()) {
+      const vx = c.x - gx;
+      const vy = c.y - gy;
+      const vz = c.z - gz;
+      const radius = Math.sqrt(vx * vx + vy * vy + vz * vz);
+      if (!Number.isFinite(radius) || radius < 1e-8) continue;
+
+      let targetRadius = radius;
+      if (radius > maxAllowed) {
+        targetRadius = maxAllowed;
+      } else if (radius < minAllowed) {
+        targetRadius = minAllowed;
+      }
+      const radialScale = targetRadius / radius;
+      if (Math.abs(radialScale - 1) < 1e-3) continue;
+
+      const targetCx = gx + vx * radialScale;
+      const targetCy = gy + vy * radialScale;
+      const targetCz = gz + vz * radialScale;
+      const dxShift = targetCx - c.x;
+      const dyShift = targetCy - c.y;
+      const dzShift = targetCz - c.z;
+
+      for (const idx of c.idxs) {
+        out[idx].x += dxShift;
+        out[idx].y += dyShift;
+        out[idx].z += dzShift;
+      }
+    }
+
+    // Pairwise centroid separation: enforce clear "island" separation
+    // while keeping everything inside a compact spherical shell.
+    const recomputeCentroids = (): Array<{ key: string; x: number; y: number; z: number; idxs: number[] }> => {
+      const list: Array<{ key: string; x: number; y: number; z: number; idxs: number[] }> = [];
+      for (const [key, idxs] of groups.entries()) {
+        if (idxs.length === 0) continue;
+        let cx = 0;
+        let cy = 0;
+        let cz = 0;
+        for (const idx of idxs) {
+          cx += out[idx].x;
+          cy += out[idx].y;
+          cz += out[idx].z;
+        }
+        list.push({ key, x: cx / idxs.length, y: cy / idxs.length, z: cz / idxs.length, idxs });
+      }
+      return list;
+    };
+
+    const centroids0 = recomputeCentroids();
+    if (centroids0.length >= 3) {
+      const shellRadius = median;
+      const desiredMin = shellRadius * 1.05;
+
+      for (let iter = 0; iter < 10; iter += 1) {
+        const centroids = recomputeCentroids();
+
+        for (let i = 0; i < centroids.length; i += 1) {
+          for (let j = i + 1; j < centroids.length; j += 1) {
+            const a = centroids[i];
+            const b = centroids[j];
+            const dx = b.x - a.x;
+            const dy = b.y - a.y;
+            const dz = b.z - a.z;
+            const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (!Number.isFinite(dist) || dist < 1e-6 || dist >= desiredMin) continue;
+
+            const push = (desiredMin - dist) * 0.24;
+            const ux = dx / dist;
+            const uy = dy / dist;
+            const uz = dz / dist;
+
+            for (const idx of a.idxs) {
+              out[idx].x -= ux * push;
+              out[idx].y -= uy * push;
+              out[idx].z -= uz * push;
+            }
+            for (const idx of b.idxs) {
+              out[idx].x += ux * push;
+              out[idx].y += uy * push;
+              out[idx].z += uz * push;
+            }
+          }
+        }
+
+        // Keep centroids in a compact spherical domain after each repel pass.
+        const after = recomputeCentroids();
+        for (const c of after) {
+          const vx = c.x - gx;
+          const vy = c.y - gy;
+          const vz = c.z - gz;
+          const r = Math.sqrt(vx * vx + vy * vy + vz * vz);
+          if (!Number.isFinite(r) || r < 1e-8) continue;
+
+          let targetR = r;
+          if (r < minAllowed) targetR = minAllowed;
+          if (r > maxAllowed) targetR = maxAllowed;
+          const scale = targetR / r;
+          if (Math.abs(scale - 1) < 1e-3) continue;
+
+          const tx = gx + vx * scale;
+          const ty = gy + vy * scale;
+          const tz = gz + vz * scale;
+          const sx = tx - c.x;
+          const sy = ty - c.y;
+          const sz = tz - c.z;
+
+          for (const idx of c.idxs) {
+            out[idx].x += sx;
+            out[idx].y += sy;
+            out[idx].z += sz;
+          }
+        }
+      }
+    }
+  }
+
+  return out;
+}
 
 function cellKey(ix: number, iy: number, iz: number): string {
   return `${ix}:${iy}:${iz}`;
@@ -235,8 +570,11 @@ function computeApproxKnnClusterLabels(points: ScaledPoint[]): string[] {
   return labels;
 }
 
-export function transformPointsForScene(points: RawPoint[]): PointTransformResult {
-  const validPoints = points
+export function transformPointsForScene(
+  points: RawPoint[],
+  options: PointTransformOptions = {}
+): PointTransformResult {
+  const basePoints = points
     .filter((point) => finiteNumber(point.x) && finiteNumber(point.y) && finiteNumber(point.z))
     .map((point) => ({
       id: point.id,
@@ -244,7 +582,17 @@ export function transformPointsForScene(points: RawPoint[]): PointTransformResul
       y: point.y as number,
       z: point.z as number,
       cluster_id: point.cluster_id ?? null,
+      neighborhood_key: point.neighborhood_key ?? null,
+      neighborhood_label: point.neighborhood_label ?? null,
+      local_cluster_id: point.local_cluster_id ?? null,
+      local_distortion: point.local_distortion ?? null,
+      stitch_distortion: point.stitch_distortion ?? null,
     }));
+
+  const intraClusterScale = options.intraClusterScale ?? 1.0;
+  const macroSeparation = options.macroSeparation ?? 1.0;
+  const withMacroSpacing = expandInterClusterSpacing(basePoints, macroSeparation);
+  const validPoints = expandIntraClusterSpacing(withMacroSpacing, intraClusterScale);
 
   if (validPoints.length === 0) {
     return {
@@ -302,7 +650,27 @@ export function transformPointsForScene(points: RawPoint[]): PointTransformResul
     scaledPoints[i] = { x: sx, y: sy, z: sz };
   }
 
-  const clusterLabels = computeApproxKnnClusterLabels(scaledPoints);
+  const colorBy = options.colorBy ?? "neighborhood";
+
+  let clusterLabels: string[];
+  if (colorBy === "local_cluster") {
+    clusterLabels = validPoints.map((p) => {
+      if (p.local_cluster_id !== null && p.local_cluster_id !== undefined) {
+        const key = p.neighborhood_key ?? "misc::unknown";
+        return `${key}::c${String(p.local_cluster_id)}`;
+      }
+      return p.neighborhood_key ?? p.cluster_id ?? "-1";
+    });
+  } else {
+    const hasNeighborhood = validPoints.some((p) => p.neighborhood_key && p.neighborhood_key.length > 0);
+    if (hasNeighborhood) {
+      clusterLabels = validPoints.map((p) => p.neighborhood_key ?? p.cluster_id ?? "-1");
+    } else {
+      clusterLabels = shouldUseBackendClusterIds(validPoints)
+        ? buildClusterLabelsFromBackend(validPoints)
+        : computeApproxKnnClusterLabels(scaledPoints);
+    }
+  }
 
   const colors = new Float32Array(validPoints.length * 3);
   const clusterCounts = buildClusterCounts(clusterLabels);
@@ -312,12 +680,24 @@ export function transformPointsForScene(points: RawPoint[]): PointTransformResul
     const clusterId = clusterLabels[i];
     let rgb = FALLBACK_UNCLUSTERED;
     const clusterSize = clusterCounts.get(clusterId) ?? 0;
-    if (clusterSize < MIN_CLUSTER_POINTS_FOR_COLOR) {
-      rgb = [1.0, 1.0, 1.0];
+    if (colorBy === "neighborhood") {
+      rgb = colorForNeighborhood(clusterId);
+      if (clusterSize < MIN_CLUSTER_POINTS_FOR_COLOR) {
+        // keep small groups in macro family, just dimmer.
+        rgb = hslToRgb(baseHueForMacro(extractMacroKey(clusterId)) / 360, 0.35, 0.62);
+      }
+    } else if (colorBy === "local_cluster") {
+      rgb = colorForLocalClusterLabel(clusterId);
+      if (clusterSize < MIN_CLUSTER_POINTS_FOR_COLOR) {
+        const macroHue = baseHueForMacro(extractMacroKey(clusterId)) / 360;
+        rgb = hslToRgb(macroHue, 0.45, 0.58);
+      }
     } else {
-      rgb = topClusters.has(clusterId)
-        ? colorForTopCluster(clusterId)
-        : colorForSmallCluster(clusterId);
+      if (clusterSize < MIN_CLUSTER_POINTS_FOR_COLOR) {
+        rgb = colorForSmallCluster(clusterId);
+      } else {
+        rgb = topClusters.has(clusterId) ? colorForTopCluster(clusterId) : colorForSmallCluster(clusterId);
+      }
     }
     colors[i * 3] = rgb[0];
     colors[i * 3 + 1] = rgb[1];

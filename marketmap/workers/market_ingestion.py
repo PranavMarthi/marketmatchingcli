@@ -113,6 +113,7 @@ def _upsert_markets(session, market_rows: list[dict]) -> None:  # type: ignore[t
                 "outcome_prices": stmt.excluded.outcome_prices,
                 "clob_token_ids": stmt.excluded.clob_token_ids,
                 "event_id": stmt.excluded.event_id,
+                "polymarket_event_id": stmt.excluded.polymarket_event_id,
                 "is_active": stmt.excluded.is_active,
                 "updated_at": datetime.now(timezone.utc),
             },
