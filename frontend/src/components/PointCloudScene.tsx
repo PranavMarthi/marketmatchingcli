@@ -229,7 +229,7 @@ function EventEdges({
       const a = edge.sourceIndex * 3;
       const b = edge.targetIndex * 3;
       const confidence = clamp(edge.confidence, 0, 1);
-      const intensity = 0.25 + confidence * 0.6;
+      const intensity = 0.45 + confidence * 0.55;
 
       linePositions[i * 6] = positions[a];
       linePositions[i * 6 + 1] = positions[a + 1];
@@ -253,7 +253,7 @@ function EventEdges({
     const material = new LineBasicMaterial({
       vertexColors: true,
       transparent: true,
-      opacity: 0.32,
+      opacity: 0.82,
       depthWrite: false,
       toneMapped: false,
     });

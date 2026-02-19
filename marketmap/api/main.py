@@ -157,8 +157,8 @@ def _edge_row_to_link(row) -> GraphLink:  # type: ignore[no-untyped-def]
     )
 
 
-EVENT_EDGE_NON_SEMANTIC_FLOOR = 0.20
 EVENT_EDGE_MAX_PER_NODE = 4
+EVENT_EDGE_MAX_DISTANCE_QUANTILE = 0.90
 
 
 async def _fetch_event_links(
@@ -173,107 +173,147 @@ async def _fetch_event_links(
     result = await session.execute(
         text(
             """
-            WITH event_nodes AS (
-                SELECT event_id,
-                       COALESCE(NULLIF(neighborhood_key, ''), 'misc') AS neighborhood_key,
-                       COALESCE(local_cluster_id, -1) AS local_cluster_id
-                FROM event_projection_3d
-                WHERE event_id = ANY(:event_ids)
+            WITH
+            event_meta AS (
+                SELECT
+                    ep.event_id,
+                    COALESCE(NULLIF(ep.neighborhood_key, ''), 'misc::unknown') AS neighborhood_key,
+                    COALESCE(ep.local_cluster_id, -1) AS local_cluster_id,
+                    ep.x,
+                    ep.y,
+                    ep.z
+                FROM event_projection_3d ep
+                WHERE ep.event_id = ANY(:event_ids)
             ),
             pair_scores AS (
                 SELECT
                     LEAST(m1.polymarket_event_id, m2.polymarket_event_id) AS source_event_id,
                     GREATEST(m1.polymarket_event_id, m2.polymarket_event_id) AS target_event_id,
-                    AVG(COALESCE(me.stat_score, 0.0)) AS stat_score,
-                    AVG(COALESCE(me.logical_score, 0.0)) AS logical_score,
-                    AVG(COALESCE(me.propagation_score, 0.0)) AS propagation_score,
-                    AVG(COALESCE(me.entity_overlap_score, 0.0)) AS entity_overlap_score,
                     AVG(COALESCE(me.semantic_score, 0.0)) AS semantic_score,
                     COUNT(*)::int AS support_count
                 FROM market_edges me
                 JOIN markets m1 ON m1.id = me.source_id
                 JOIN markets m2 ON m2.id = me.target_id
-                JOIN event_nodes e1 ON e1.event_id = m1.polymarket_event_id
-                JOIN event_nodes e2 ON e2.event_id = m2.polymarket_event_id
-                WHERE me.edge_type = 'hedge'
+                WHERE me.edge_type = 'discovery'
                   AND m1.polymarket_event_id IS NOT NULL
                   AND m2.polymarket_event_id IS NOT NULL
                   AND m1.polymarket_event_id <> m2.polymarket_event_id
-                  AND e1.neighborhood_key = e2.neighborhood_key
-                  AND e1.local_cluster_id = e2.local_cluster_id
+                  AND m1.polymarket_event_id = ANY(:event_ids)
+                  AND m2.polymarket_event_id = ANY(:event_ids)
                 GROUP BY
                     LEAST(m1.polymarket_event_id, m2.polymarket_event_id),
                     GREATEST(m1.polymarket_event_id, m2.polymarket_event_id)
+            ),
+            pair_local AS (
+                SELECT
+                    p.source_event_id,
+                    p.target_event_id,
+                    p.semantic_score,
+                    p.support_count,
+                    a.neighborhood_key AS source_neighborhood,
+                    b.neighborhood_key AS target_neighborhood,
+                    a.local_cluster_id AS source_local_cluster_id,
+                    b.local_cluster_id AS target_local_cluster_id,
+                    SQRT(
+                        POWER(a.x - b.x, 2)
+                        + POWER(a.y - b.y, 2)
+                        + POWER(a.z - b.z, 2)
+                    ) AS d3
+                FROM pair_scores p
+                JOIN event_meta a ON a.event_id = p.source_event_id
+                JOIN event_meta b ON b.event_id = p.target_event_id
+                WHERE a.neighborhood_key = b.neighborhood_key
+                  AND a.local_cluster_id = b.local_cluster_id
+                  AND a.local_cluster_id >= 0
+            ),
+            d3_stats AS (
+                SELECT
+                    PERCENTILE_CONT(:event_edge_max_d3_q) WITHIN GROUP (ORDER BY d3) AS d3_cutoff
+                FROM pair_local
+            ),
+            pair_filtered AS (
+                SELECT
+                    p.source_event_id,
+                    p.target_event_id,
+                    p.semantic_score,
+                    p.support_count,
+                    p.d3,
+                    s.d3_cutoff
+                FROM pair_local p
+                CROSS JOIN d3_stats s
+                WHERE s.d3_cutoff IS NULL OR p.d3 <= s.d3_cutoff
+            ),
+            directed_pairs AS (
+                SELECT source_event_id AS src, target_event_id AS dst, semantic_score, support_count, d3, d3_cutoff
+                FROM pair_filtered
+                UNION ALL
+                SELECT target_event_id AS src, source_event_id AS dst, semantic_score, support_count, d3, d3_cutoff
+                FROM pair_filtered
+            ),
+            directed_ranked AS (
+                SELECT
+                    src,
+                    dst,
+                    semantic_score,
+                    support_count,
+                    d3,
+                    d3_cutoff,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY src
+                        ORDER BY semantic_score DESC, support_count DESC, d3 ASC, dst ASC
+                    ) AS rn
+                FROM directed_pairs
+                WHERE semantic_score >= :min_conf
+            ),
+            selected_pairs AS (
+                SELECT
+                    LEAST(src, dst) AS source_event_id,
+                    GREATEST(src, dst) AS target_event_id,
+                    MAX(semantic_score) AS semantic_score,
+                    MAX(support_count) AS support_count,
+                    MIN(d3) AS d3,
+                    MAX(d3_cutoff) AS d3_cutoff
+                FROM directed_ranked
+                WHERE rn <= :max_edges_per_event
+                GROUP BY LEAST(src, dst), GREATEST(src, dst)
+                HAVING COUNT(*) = 2
             )
             SELECT source_event_id,
                    target_event_id,
-                   stat_score,
-                   logical_score,
-                   propagation_score,
-                   entity_overlap_score,
                    semantic_score,
                    support_count,
-                   (
-                     0.35 * stat_score
-                     + 0.30 * logical_score
-                     + 0.20 * propagation_score
-                     + 0.10 * entity_overlap_score
-                     + 0.05 * semantic_score
-                   ) AS confidence,
-                   (
-                     0.35 * stat_score
-                     + 0.30 * logical_score
-                     + 0.20 * propagation_score
-                     + 0.10 * entity_overlap_score
-                   ) AS non_semantic_strength
-            FROM pair_scores
-            ORDER BY confidence DESC
+                   d3,
+                   d3_cutoff
+            FROM selected_pairs
+            ORDER BY semantic_score DESC, support_count DESC, d3 ASC
+            LIMIT :pair_cap
             """
         ),
-        {"event_ids": event_ids},
+        {
+            "event_ids": event_ids,
+            "min_conf": min_conf,
+            "max_edges_per_event": max_edges_per_event,
+            "event_edge_max_d3_q": EVENT_EDGE_MAX_DISTANCE_QUANTILE,
+            "pair_cap": max(12_000, min(120_000, len(event_ids) * max_edges_per_event * 3)),
+        },
     )
 
-    candidates = []
-    for row in result.fetchall():
-        confidence = float(row[8])
-        non_semantic_strength = float(row[9])
-        if confidence < min_conf:
-            continue
-        if non_semantic_strength < EVENT_EDGE_NON_SEMANTIC_FLOOR:
-            continue
-        candidates.append(row)
-
-    candidates.sort(key=lambda r: float(r[8]), reverse=True)
-    per_node_counts: dict[str, int] = {}
     links: list[GraphLink] = []
-
-    for row in candidates:
+    for row in result.fetchall():
         src = str(row[0])
         tgt = str(row[1])
-        src_count = per_node_counts.get(src, 0)
-        tgt_count = per_node_counts.get(tgt, 0)
-        if src_count >= max_edges_per_event or tgt_count >= max_edges_per_event:
-            continue
-
-        confidence = float(row[8])
+        semantic_score = float(row[2])
+        confidence = min(1.0, max(0.0, semantic_score))
         explanation = {
-            "type": "event_cluster_relation",
+            "type": "event_relation_semantic",
             "formula": {
-                "statistical_strength": 0.35,
-                "logical_consistency": 0.30,
-                "propagation_signal": 0.20,
-                "entity_overlap": 0.10,
-                "semantic_similarity": 0.05,
+                "confidence": "avg(discovery.semantic_score)",
             },
-            "non_semantic_floor": EVENT_EDGE_NON_SEMANTIC_FLOOR,
             "components": {
-                "statistical_strength": round(float(row[2]), 4),
-                "logical_consistency": round(float(row[3]), 4),
-                "propagation_signal": round(float(row[4]), 4),
-                "entity_overlap": round(float(row[5]), 4),
-                "semantic_similarity": round(float(row[6]), 4),
-                "support_count": int(row[7]),
-                "non_semantic_strength": round(float(row[9]), 4),
+                "semantic_similarity": round(semantic_score, 4),
+                "support_count": int(row[3]),
+                "d3": round(float(row[4]), 6) if row[4] is not None else None,
+                "d3_cutoff": round(float(row[5]), 6) if row[5] is not None else None,
             },
         }
 
@@ -282,20 +322,17 @@ async def _fetch_event_links(
                 source=src,
                 target=tgt,
                 confidence=confidence,
-                type="event_cluster",
+                type="semantic",
                 weight=confidence,
-                semantic_score=float(row[6]),
-                stat_score=float(row[2]),
-                logical_score=float(row[3]),
-                propagation_score=float(row[4]),
-                entity_overlap_score=float(row[5]),
+                semantic_score=semantic_score,
+                stat_score=None,
+                logical_score=None,
+                propagation_score=None,
+                entity_overlap_score=None,
                 template_penalty=0.0,
                 explanation=explanation,
             )
         )
-
-        per_node_counts[src] = src_count + 1
-        per_node_counts[tgt] = tgt_count + 1
 
     return links
 

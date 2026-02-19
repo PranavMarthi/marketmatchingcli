@@ -153,12 +153,17 @@ def compute_local_clusters() -> dict[str, int | str]:
                         for cid, vecs in by_cluster.items()
                         if vecs
                     }
-                    stable_ids = [cid for cid in sorted(counts.keys()) if cid not in tiny_ids]
+                    stable_ids = [
+                        cid for cid in sorted(counts.keys()) if cid not in tiny_ids and cid in centroid
+                    ]
+                    if not stable_ids:
+                        # Nothing to merge into safely; keep existing assignments.
+                        stable_ids = []
                     for mid, cid in list(assigned_labels.items()):
                         if cid not in tiny_ids:
                             continue
                         vec = vec_by_market.get(mid)
-                        if vec is None:
+                        if vec is None or not stable_ids:
                             continue
                         nearest = min(
                             stable_ids,
