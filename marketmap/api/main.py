@@ -12,6 +12,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from marketmap.api.schemas import (
+    EventContextResponse,
+    EventRelatedNode,
     GraphLink,
     GraphResponse,
     HealthResponse,
@@ -157,15 +159,10 @@ def _edge_row_to_link(row) -> GraphLink:  # type: ignore[no-untyped-def]
     )
 
 
-EVENT_EDGE_NON_SEMANTIC_FLOOR = 0.20
-EVENT_EDGE_MAX_PER_NODE = 4
-
-
 async def _fetch_event_links(
     session: AsyncSession,
     event_ids: list[str],
     min_conf: float,
-    max_edges_per_event: int = EVENT_EDGE_MAX_PER_NODE,
 ) -> list[GraphLink]:
     if len(event_ids) < 2:
         return []
@@ -173,108 +170,98 @@ async def _fetch_event_links(
     result = await session.execute(
         text(
             """
-            WITH event_nodes AS (
-                SELECT event_id,
-                       COALESCE(NULLIF(neighborhood_key, ''), 'misc') AS neighborhood_key,
-                       COALESCE(local_cluster_id, -1) AS local_cluster_id
-                FROM event_projection_3d
-                WHERE event_id = ANY(:event_ids)
+            WITH node_set AS (
+                SELECT UNNEST(CAST(:event_ids AS text[])) AS event_id
             ),
-            pair_scores AS (
+            cluster_nodes AS (
                 SELECT
-                    LEAST(m1.polymarket_event_id, m2.polymarket_event_id) AS source_event_id,
-                    GREATEST(m1.polymarket_event_id, m2.polymarket_event_id) AS target_event_id,
-                    AVG(COALESCE(me.stat_score, 0.0)) AS stat_score,
-                    AVG(COALESCE(me.logical_score, 0.0)) AS logical_score,
-                    AVG(COALESCE(me.propagation_score, 0.0)) AS propagation_score,
-                    AVG(COALESCE(me.entity_overlap_score, 0.0)) AS entity_overlap_score,
-                    AVG(COALESCE(me.semantic_score, 0.0)) AS semantic_score,
-                    COUNT(*)::int AS support_count
-                FROM market_edges me
-                JOIN markets m1 ON m1.id = me.source_id
-                JOIN markets m2 ON m2.id = me.target_id
-                JOIN event_nodes e1 ON e1.event_id = m1.polymarket_event_id
-                JOIN event_nodes e2 ON e2.event_id = m2.polymarket_event_id
-                WHERE me.edge_type = 'hedge'
-                  AND m1.polymarket_event_id IS NOT NULL
-                  AND m2.polymarket_event_id IS NOT NULL
-                  AND m1.polymarket_event_id <> m2.polymarket_event_id
-                  AND e1.neighborhood_key = e2.neighborhood_key
-                  AND e1.local_cluster_id = e2.local_cluster_id
-                GROUP BY
-                    LEAST(m1.polymarket_event_id, m2.polymarket_event_id),
-                    GREATEST(m1.polymarket_event_id, m2.polymarket_event_id)
+                    ep.event_id,
+                    ep.local_cluster_id,
+                    COALESCE(NULLIF(ep.neighborhood_key, ''), 'misc') AS neighborhood_key
+                FROM event_projection_3d ep
+                JOIN node_set ns ON ns.event_id = ep.event_id
+                WHERE ep.local_cluster_id IS NOT NULL
+                  AND ep.local_cluster_id >= 0
+            ),
+            cluster_sizes AS (
+                SELECT neighborhood_key, local_cluster_id, COUNT(*)::int AS cluster_size
+                FROM cluster_nodes
+                GROUP BY neighborhood_key, local_cluster_id
+            ),
+            directed AS (
+                SELECT
+                    a.event_id AS source_event_id,
+                    b.target_event_id AS target_event_id,
+                    a.local_cluster_id AS cluster_id,
+                    a.neighborhood_key AS neighborhood_key
+                FROM cluster_nodes a
+                JOIN LATERAL (
+                    SELECT c.event_id AS target_event_id
+                    FROM cluster_nodes c
+                    WHERE c.local_cluster_id = a.local_cluster_id
+                      AND c.neighborhood_key = a.neighborhood_key
+                      AND c.event_id <> a.event_id
+                    ORDER BY c.event_id
+                    LIMIT :max_edges_per_node
+                ) b ON TRUE
+            ),
+            undirected AS (
+                SELECT
+                    LEAST(source_event_id, target_event_id) AS source_event_id,
+                    GREATEST(source_event_id, target_event_id) AS target_event_id,
+                    cluster_id,
+                    neighborhood_key,
+                    COUNT(*)::int AS support
+                FROM directed
+                GROUP BY 1, 2, 3, 4
+            ),
+            ranked AS (
+                SELECT
+                    u.source_event_id,
+                    u.target_event_id,
+                    1.0::double precision AS confidence,
+                    u.cluster_id,
+                    u.neighborhood_key,
+                    u.support,
+                    LEAST(:cluster_edge_cap_max, cs.cluster_size * :cluster_edge_cap_factor) AS cluster_edge_cap,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY u.neighborhood_key, u.cluster_id
+                        ORDER BY u.support DESC, u.source_event_id, u.target_event_id
+                    ) AS edge_rank
+                FROM undirected u
+                JOIN cluster_sizes cs
+                  ON cs.local_cluster_id = u.cluster_id
+                 AND cs.neighborhood_key = u.neighborhood_key
             )
-            SELECT source_event_id,
-                   target_event_id,
-                   stat_score,
-                   logical_score,
-                   propagation_score,
-                   entity_overlap_score,
-                   semantic_score,
-                   support_count,
-                   (
-                     0.35 * stat_score
-                     + 0.30 * logical_score
-                     + 0.20 * propagation_score
-                     + 0.10 * entity_overlap_score
-                     + 0.05 * semantic_score
-                   ) AS confidence,
-                   (
-                     0.35 * stat_score
-                     + 0.30 * logical_score
-                     + 0.20 * propagation_score
-                     + 0.10 * entity_overlap_score
-                   ) AS non_semantic_strength
-            FROM pair_scores
-            ORDER BY confidence DESC
+            SELECT source_event_id, target_event_id, confidence, cluster_id
+            FROM ranked
+            WHERE confidence >= :min_conf
+              AND edge_rank <= cluster_edge_cap
+            ORDER BY neighborhood_key, cluster_id, source_event_id, target_event_id
             """
         ),
-        {"event_ids": event_ids},
+        {
+            "event_ids": event_ids,
+            "min_conf": min_conf,
+            "max_edges_per_node": 10,
+            "cluster_edge_cap_max": 500,
+            "cluster_edge_cap_factor": 3,
+        },
     )
 
-    candidates = []
-    for row in result.fetchall():
-        confidence = float(row[8])
-        non_semantic_strength = float(row[9])
-        if confidence < min_conf:
-            continue
-        if non_semantic_strength < EVENT_EDGE_NON_SEMANTIC_FLOOR:
-            continue
-        candidates.append(row)
-
-    candidates.sort(key=lambda r: float(r[8]), reverse=True)
-    per_node_counts: dict[str, int] = {}
     links: list[GraphLink] = []
-
-    for row in candidates:
+    for row in result.fetchall():
         src = str(row[0])
         tgt = str(row[1])
-        src_count = per_node_counts.get(src, 0)
-        tgt_count = per_node_counts.get(tgt, 0)
-        if src_count >= max_edges_per_event or tgt_count >= max_edges_per_event:
-            continue
-
-        confidence = float(row[8])
+        confidence = float(row[2])
+        cluster_id = int(row[3])
         explanation = {
-            "type": "event_cluster_relation",
-            "formula": {
-                "statistical_strength": 0.35,
-                "logical_consistency": 0.30,
-                "propagation_signal": 0.20,
-                "entity_overlap": 0.10,
-                "semantic_similarity": 0.05,
-            },
-            "non_semantic_floor": EVENT_EDGE_NON_SEMANTIC_FLOOR,
-            "components": {
-                "statistical_strength": round(float(row[2]), 4),
-                "logical_consistency": round(float(row[3]), 4),
-                "propagation_signal": round(float(row[4]), 4),
-                "entity_overlap": round(float(row[5]), 4),
-                "semantic_similarity": round(float(row[6]), 4),
-                "support_count": int(row[7]),
-                "non_semantic_strength": round(float(row[9]), 4),
-            },
+            "type": "hdbscan_cluster",
+            "cluster_id": cluster_id,
+            "link_rule": "same_cluster_limited",
+            "max_edges_per_node": 10,
+            "cluster_edge_cap_max": 500,
+            "cluster_edge_cap_factor": 3,
         }
 
         links.append(
@@ -282,20 +269,12 @@ async def _fetch_event_links(
                 source=src,
                 target=tgt,
                 confidence=confidence,
-                type="event_cluster",
+                type="hdbscan_cluster",
                 weight=confidence,
-                semantic_score=float(row[6]),
-                stat_score=float(row[2]),
-                logical_score=float(row[3]),
-                propagation_score=float(row[4]),
-                entity_overlap_score=float(row[5]),
                 template_penalty=0.0,
                 explanation=explanation,
             )
         )
-
-        per_node_counts[src] = src_count + 1
-        per_node_counts[tgt] = tgt_count + 1
 
     return links
 
@@ -1151,6 +1130,95 @@ async def get_related_markets(
             "related_count": len(related_ids),
             "edge_count": len(links),
         },
+    )
+
+
+@app.get("/event/{event_id}/context", response_model=EventContextResponse)
+async def get_event_context(
+    event_id: str,
+    related_limit: int = Query(5000, ge=1, le=50000),
+    session: AsyncSession = Depends(get_async_session),
+) -> EventContextResponse:
+    event_row = await session.execute(
+        text(
+            """
+            SELECT ep.event_id,
+                   COALESCE(e.title, ep.event_id) AS label,
+                   ep.local_cluster_id,
+                   COALESCE(NULLIF(ep.neighborhood_key, ''), 'misc') AS neighborhood_key,
+                   ep.x, ep.y, ep.z
+            FROM event_projection_3d ep
+            JOIN polymarket_events e ON e.id = ep.event_id
+            WHERE ep.event_id = :event_id
+            """
+        ),
+        {"event_id": event_id},
+    )
+    row = event_row.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    tags_result = await session.execute(
+        text(
+            """
+            SELECT pt.tag
+            FROM polymarket_event_tags pet
+            JOIN polymarket_tags pt ON pt.id = pet.tag_id
+            WHERE pet.event_id = :event_id
+            ORDER BY pt.tag ASC
+            """
+        ),
+        {"event_id": event_id},
+    )
+    tags = [str(r[0]) for r in tags_result.fetchall() if r[0]]
+
+    related_nodes: list[EventRelatedNode] = []
+    local_cluster_id = row[2]
+    neighborhood_key = str(row[3])
+    if local_cluster_id is not None and int(local_cluster_id) >= 0:
+        related_result = await session.execute(
+            text(
+                """
+                SELECT ep.event_id,
+                       COALESCE(e.title, ep.event_id) AS label,
+                       sqrt(
+                         power(ep.x - :x, 2) +
+                         power(ep.y - :y, 2) +
+                         power(ep.z - :z, 2)
+                       ) AS distance
+                FROM event_projection_3d ep
+                JOIN polymarket_events e ON e.id = ep.event_id
+                WHERE ep.local_cluster_id = :cluster_id
+                  AND COALESCE(NULLIF(ep.neighborhood_key, ''), 'misc') = :neighborhood_key
+                  AND ep.event_id <> :event_id
+                ORDER BY distance ASC, ep.event_id ASC
+                LIMIT :related_limit
+                """
+            ),
+            {
+                "event_id": event_id,
+                "cluster_id": int(local_cluster_id),
+                "neighborhood_key": neighborhood_key,
+                "x": float(row[4]),
+                "y": float(row[5]),
+                "z": float(row[6]),
+                "related_limit": related_limit,
+            },
+        )
+        related_nodes = [
+            EventRelatedNode(
+                id=str(rr[0]),
+                label=str(rr[1]),
+                distance=float(rr[2]) if rr[2] is not None else None,
+            )
+            for rr in related_result.fetchall()
+        ]
+
+    return EventContextResponse(
+        event_id=str(row[0]),
+        label=str(row[1]),
+        tags=tags,
+        related_nodes=related_nodes,
     )
 
 

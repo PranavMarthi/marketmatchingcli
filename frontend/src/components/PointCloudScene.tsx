@@ -22,6 +22,8 @@ type PointCloudSceneProps = {
   positions: Float32Array;
   colors: Float32Array;
   pointCount: number;
+  highlightedPointIndices?: Set<number> | null;
+  selectedPointIndex?: number | null;
   edges?: Array<{
     sourceIndex: number;
     targetIndex: number;
@@ -279,6 +281,8 @@ function CloudPoints({
   pointSize,
   pointCount,
   suggestedCameraDistance,
+  highlightedPointIndices,
+  selectedPointIndex,
   onPointClick,
   onPointHover,
 }: {
@@ -287,6 +291,8 @@ function CloudPoints({
   pointSize: number;
   pointCount: number;
   suggestedCameraDistance: number;
+  highlightedPointIndices?: Set<number> | null;
+  selectedPointIndex?: number | null;
   onPointClick?: (pointIndex: number) => void;
   onPointHover?: (pointIndex: number | null) => void;
 }): JSX.Element {
@@ -330,7 +336,11 @@ function CloudPoints({
         localScale *= Math.pow(distanceRatio, PER_POINT_DISTANCE_EXPONENT);
       }
 
-      dummy.scale.setScalar(localScale);
+      const hasHighlight = !!highlightedPointIndices && highlightedPointIndices.size > 0;
+      const isSelected = selectedPointIndex === i;
+      const isConnected = hasHighlight && highlightedPointIndices.has(i);
+      const highlightScale = hasHighlight ? (isSelected ? 2.1 : isConnected ? 1.65 : 0.72) : 1.0;
+      dummy.scale.setScalar(localScale * highlightScale);
       dummy.updateMatrix();
       mesh.setMatrixAt(i, dummy.matrix);
     }
@@ -357,14 +367,28 @@ function CloudPoints({
     for (let i = 0; i < pointCount; i += 1) {
       const idx = i * 3;
       dummy.position.set(positions[idx], positions[idx + 1], positions[idx + 2]);
-      dummy.scale.setScalar(pointSize * appliedScaleRef.current);
+      const hasHighlight = !!highlightedPointIndices && highlightedPointIndices.size > 0;
+      const isSelected = selectedPointIndex === i;
+      const isConnected = hasHighlight && highlightedPointIndices.has(i);
+      const highlightScale = hasHighlight ? (isSelected ? 2.1 : isConnected ? 1.65 : 0.72) : 1.0;
+      dummy.scale.setScalar(pointSize * appliedScaleRef.current * highlightScale);
       dummy.updateMatrix();
       mesh.setMatrixAt(i, dummy.matrix);
 
-      const r = Math.max(0.25, Math.min(1, colors[idx]));
-      const g = Math.max(0.25, Math.min(1, colors[idx + 1]));
-      const b = Math.max(0.25, Math.min(1, colors[idx + 2]));
-      color.setRGB(r, g, b);
+      if (hasHighlight) {
+        if (isSelected) {
+          color.setRGB(1, 0.95, 0.4);
+        } else if (isConnected) {
+          color.setRGB(0.2, 0.95, 1);
+        } else {
+          color.setRGB(0.03, 0.05, 0.09);
+        }
+      } else {
+        const r = Math.max(0.25, Math.min(1, colors[idx]));
+        const g = Math.max(0.25, Math.min(1, colors[idx + 1]));
+        const b = Math.max(0.25, Math.min(1, colors[idx + 2]));
+        color.setRGB(r, g, b);
+      }
       mesh.setColorAt(i, color);
     }
 
@@ -373,7 +397,7 @@ function CloudPoints({
     if (mesh.instanceColor) {
       mesh.instanceColor.needsUpdate = true;
     }
-  }, [colors, pointCount, pointSize, positions]);
+  }, [colors, highlightedPointIndices, pointCount, pointSize, positions, selectedPointIndex]);
 
   useFrame((state) => {
     const referenceDistance = Math.max(1, suggestedCameraDistance);
@@ -430,6 +454,8 @@ export default function PointCloudScene({
   positions,
   colors,
   pointCount,
+  highlightedPointIndices = null,
+  selectedPointIndex = null,
   edges = [],
   neighborhoodShells = [],
   suggestedCameraDistance,
@@ -449,7 +475,12 @@ export default function PointCloudScene({
         position: [0, 0, suggestedCameraDistance]
       }}
       dpr={[1, Math.min(window.devicePixelRatio || 1, 2)]}
-      gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
+      gl={{
+        antialias: true,
+        alpha: true,
+        powerPreference: "high-performance",
+        failIfMajorPerformanceCaveat: true,
+      }}
       shadows={false}
     >
       <color attach="background" args={["#05060a"]} />
@@ -469,6 +500,8 @@ export default function PointCloudScene({
           pointSize={pointSize}
           pointCount={pointCount}
           suggestedCameraDistance={suggestedCameraDistance}
+          highlightedPointIndices={highlightedPointIndices}
+          selectedPointIndex={selectedPointIndex}
           onPointClick={onPointClick}
           onPointHover={onPointHover}
         />

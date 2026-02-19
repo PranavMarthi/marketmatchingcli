@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 import umap
-from sklearn.cluster import KMeans
+from sklearn.cluster import HDBSCAN, KMeans
 from sklearn.neighbors import NearestNeighbors
 from sqlalchemy import text
 
@@ -173,17 +173,20 @@ def _local_distortion(emb: np.ndarray, xyz: np.ndarray, k: int = 10) -> np.ndarr
     if n <= 2:
         return np.zeros(n, dtype=np.float32)
     kk = max(1, min(k, n - 1))
-    emb_nn = NearestNeighbors(n_neighbors=kk + 1, metric="cosine", algorithm="brute")
+    # sklearn requires n_neighbors < n_samples_fit for this query path.
+    query_k = max(1, min(kk + 1, n - 1))
+    emb_nn = NearestNeighbors(n_neighbors=query_k, metric="cosine", algorithm="brute")
     emb_nn.fit(emb)
     _, emb_ids = emb_nn.kneighbors(return_distance=True)
-    xyz_nn = NearestNeighbors(n_neighbors=kk + 1, metric="euclidean", algorithm="auto")
+    xyz_nn = NearestNeighbors(n_neighbors=query_k, metric="euclidean", algorithm="auto")
     xyz_nn.fit(xyz)
     _, xyz_ids = xyz_nn.kneighbors(return_distance=True)
     out = np.zeros(n, dtype=np.float32)
+    overlap_k = max(1, emb_ids.shape[1] - 1)
     for i in range(n):
         a = set(int(x) for x in emb_ids[i][1:])
         b = set(int(x) for x in xyz_ids[i][1:])
-        out[i] = float(1.0 - (len(a.intersection(b)) / float(kk)))
+        out[i] = float(1.0 - (len(a.intersection(b)) / float(overlap_k)))
     return np.clip(out, 0.0, 1.0)
 
 
@@ -325,6 +328,38 @@ def project_events_hierarchical(session: Any) -> dict[str, Any]:
     emb_matrix = _norm_rows(np.vstack(vectors).astype(np.float32))
     embedding_hash = hashlib.sha1(emb_matrix.tobytes()).hexdigest()[:12]
     projection_version = f"events_hproj_{embedding_hash}"
+    if len(event_ids) >= 8:
+        hdbscan_min_cluster = max(6, int(math.sqrt(len(event_ids)) * 0.9))
+        hdbscan_min_samples = max(2, min(8, hdbscan_min_cluster // 3))
+        hdbscan = HDBSCAN(
+            min_cluster_size=hdbscan_min_cluster,
+            min_samples=hdbscan_min_samples,
+            metric="euclidean",
+            algorithm="auto",
+        )
+        hdbscan_labels = np.asarray(hdbscan.fit_predict(emb_matrix), dtype=np.int32)
+    else:
+        hdbscan_labels = np.zeros(len(event_ids), dtype=np.int32)
+
+    # Ensure every node belongs to a concrete cluster.
+    assigned_mask = hdbscan_labels >= 0
+    if not np.any(assigned_mask):
+        hdbscan_labels = np.zeros(len(event_ids), dtype=np.int32)
+    elif np.any(~assigned_mask):
+        known_vecs = emb_matrix[assigned_mask]
+        known_labels = hdbscan_labels[assigned_mask]
+        unique_labels = np.unique(known_labels)
+        centroids = np.vstack([np.mean(known_vecs[known_labels == cid], axis=0) for cid in unique_labels])
+        centroids = _norm_rows(centroids.astype(np.float32))
+        noise_idxs = np.where(~assigned_mask)[0]
+        sims = emb_matrix[noise_idxs] @ centroids.T
+        nearest_cluster_idx = np.argmax(sims, axis=1)
+        hdbscan_labels[noise_idxs] = unique_labels[nearest_cluster_idx]
+
+    # Re-index labels to compact non-negative ids for storage/readability.
+    unique_labels = sorted(int(x) for x in np.unique(hdbscan_labels))
+    remap = {old: new for new, old in enumerate(unique_labels)}
+    hdbscan_labels = np.asarray([remap[int(x)] for x in hdbscan_labels], dtype=np.int32)
 
     by_key: dict[str, list[int]] = defaultdict(list)
     for i, key in enumerate(keys):
@@ -365,17 +400,10 @@ def project_events_hierarchical(session: Any) -> dict[str, Any]:
         center = np.mean(sub_xyz, axis=0)
         radius_by_key[key] = float(max(1e-6, np.percentile(np.linalg.norm(sub_xyz - center, axis=1), 90)))
 
-        k_local = max(3, min(12, int(np.sqrt(max(9, len(idxs)) / 2.6))))
-        if len(idxs) >= k_local:
-            km = KMeans(n_clusters=k_local, random_state=42, n_init="auto")
-            sub_labels = km.fit_predict(sub)
-        else:
-            sub_labels = np.zeros(len(idxs), dtype=np.int32)
-
         for j, gidx in enumerate(idxs):
             local_xyz[gidx] = sub_xyz[j]
             local_dist[gidx] = sub_dist[j]
-            local_cluster[gidx] = int(sub_labels[j])
+            local_cluster[gidx] = int(hdbscan_labels[gidx])
 
     macro_keys = sorted(centroid_by_key.keys())
     centroid_matrix = np.vstack([centroid_by_key[k] for k in macro_keys]).astype(np.float32)
@@ -418,6 +446,8 @@ def project_events_hierarchical(session: Any) -> dict[str, Any]:
         s = scale_by_key[key]
         global_xyz[i] = a + s * local_xyz[i]
         stitch_dist[i] = float(np.linalg.norm(global_xyz[i] - a))
+
+    closest_n_by_event: dict[str, list[str]] = {event_id: [] for event_id in event_ids}
 
     session.execute(text("DELETE FROM event_projection_3d"))
     session.execute(text("DELETE FROM neighborhoods"))
@@ -466,11 +496,11 @@ def project_events_hierarchical(session: Any) -> dict[str, Any]:
                 INSERT INTO event_projection_3d
                     (event_id, x, y, z, projection_version, embedding_version,
                      neighborhood_key, neighborhood_label, local_cluster_id,
-                     local_distortion, stitch_distortion, updated_at)
+                     local_distortion, stitch_distortion, closest_n_nodes, updated_at)
                 VALUES
                     (:event_id, :x, :y, :z, :projection_version, :embedding_version,
                      :neighborhood_key, :neighborhood_label, :local_cluster_id,
-                     :local_distortion, :stitch_distortion, NOW())
+                     :local_distortion, :stitch_distortion, :closest_n_nodes, NOW())
                 ON CONFLICT (event_id) DO UPDATE SET
                     x = EXCLUDED.x,
                     y = EXCLUDED.y,
@@ -482,6 +512,7 @@ def project_events_hierarchical(session: Any) -> dict[str, Any]:
                     local_cluster_id = EXCLUDED.local_cluster_id,
                     local_distortion = EXCLUDED.local_distortion,
                     stitch_distortion = EXCLUDED.stitch_distortion,
+                    closest_n_nodes = EXCLUDED.closest_n_nodes,
                     updated_at = NOW()
                 """
             ),
@@ -497,6 +528,7 @@ def project_events_hierarchical(session: Any) -> dict[str, Any]:
                 "local_cluster_id": int(local_cluster[i]),
                 "local_distortion": float(local_dist[i]),
                 "stitch_distortion": float(stitch_dist[i]),
+                "closest_n_nodes": closest_n_by_event.get(event_id, []),
             },
         )
         if i > 0 and i % 1000 == 0:

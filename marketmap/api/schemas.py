@@ -113,6 +113,19 @@ class NeighborhoodNode(BaseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
+class EventRelatedNode(BaseModel):
+    id: str
+    label: str
+    distance: float | None = None
+
+
+class EventContextResponse(BaseModel):
+    event_id: str
+    label: str
+    tags: list[str]
+    related_nodes: list[EventRelatedNode]
+
+
 class PricePoint(BaseModel):
     """A single price/probability data point."""
 
